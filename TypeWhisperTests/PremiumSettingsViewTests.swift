@@ -58,12 +58,12 @@ final class PremiumSettingsViewTests: XCTestCase {
         XCTAssertFalse(labels.contains("windowPresenter"))
     }
 
-    func testFeatureAccessSnapshotPreservesExistingEntitlementRules() {
+    func testFeatureAccessSnapshotKeepsMeetingGatedAndLocalFeaturesAvailable() {
         let free = access()
         XCTAssertEqual(free.summary, .locked)
         XCTAssertEqual(free.requirement(for: .calendarMeeting), .commercialOrPremiumAccount)
-        XCTAssertEqual(free.requirement(for: .correctionLearning), .commercialLicense)
-        XCTAssertEqual(free.requirement(for: .cloudSync), .premiumAccount)
+        XCTAssertEqual(free.requirement(for: .correctionLearning), .available)
+        XCTAssertEqual(free.requirement(for: .cloudSync), .available)
 
         let supporter = access(isSupporter: true)
         XCTAssertEqual(supporter.summary, .supporterOnly)
@@ -73,26 +73,23 @@ final class PremiumSettingsViewTests: XCTestCase {
         XCTAssertEqual(commercial.summary, .commercialLicense)
         XCTAssertEqual(commercial.requirement(for: .calendarMeeting), .available)
         XCTAssertEqual(commercial.requirement(for: .correctionLearning), .available)
-        XCTAssertEqual(commercial.requirement(for: .cloudSync), .premiumAccount)
+        XCTAssertEqual(commercial.requirement(for: .cloudSync), .available)
 
         let signedInCommercial = access(
             hasCommercialLicense: true,
             isSignedIn: true
         )
-        XCTAssertEqual(
-            signedInCommercial.requirement(for: .cloudSync),
-            .linkCommercialLicense
-        )
-        XCTAssertEqual(signedInCommercial.action(for: .cloudSync), .manageAccess)
+        XCTAssertEqual(signedInCommercial.requirement(for: .cloudSync), .available)
+        XCTAssertEqual(signedInCommercial.action(for: .cloudSync), .openSettings(.cloudSync))
 
         let account = access(hasPremiumEntitlement: true, isSignedIn: true)
         XCTAssertEqual(account.summary, .premiumAccount)
         XCTAssertEqual(account.requirement(for: .calendarMeeting), .available)
-        XCTAssertEqual(account.requirement(for: .correctionLearning), .commercialLicense)
+        XCTAssertEqual(account.requirement(for: .correctionLearning), .available)
         XCTAssertEqual(account.requirement(for: .cloudSync), .available)
 
         let signedOutAccount = access(hasPremiumEntitlement: true, isSignedIn: false)
-        XCTAssertEqual(signedOutAccount.requirement(for: .cloudSync), .signIn)
+        XCTAssertEqual(signedOutAccount.requirement(for: .cloudSync), .available)
 
         let both = access(
             hasCommercialLicense: true,
@@ -105,24 +102,24 @@ final class PremiumSettingsViewTests: XCTestCase {
         }
     }
 
-    func testFeatureActionsOpenOnlyAvailableSettings() {
+    func testFeatureActionsOpenLocalSettingsWithoutPremiumAccess() {
         let free = access()
-        for feature in PremiumFeatureID.allCases {
-            XCTAssertEqual(free.action(for: feature), .none)
-        }
+        XCTAssertEqual(free.action(for: .calendarMeeting), .none)
+        XCTAssertEqual(free.action(for: .correctionLearning), .openSettings(.correctionLearning))
+        XCTAssertEqual(free.action(for: .cloudSync), .openSettings(.cloudSync))
 
         let commercial = access(hasCommercialLicense: true)
         XCTAssertEqual(commercial.action(for: .calendarMeeting), .openSettings(.calendarMeeting))
         XCTAssertEqual(commercial.action(for: .correctionLearning), .openSettings(.correctionLearning))
-        XCTAssertEqual(commercial.action(for: .cloudSync), .manageAccess)
+        XCTAssertEqual(commercial.action(for: .cloudSync), .openSettings(.cloudSync))
 
         let account = access(hasPremiumEntitlement: true, isSignedIn: true)
         XCTAssertEqual(account.action(for: .calendarMeeting), .openSettings(.calendarMeeting))
-        XCTAssertEqual(account.action(for: .correctionLearning), .manageAccess)
+        XCTAssertEqual(account.action(for: .correctionLearning), .openSettings(.correctionLearning))
         XCTAssertEqual(account.action(for: .cloudSync), .openSettings(.cloudSync))
     }
 
-    func testEveryLicenseAccountSignInAndSupporterCombinationUsesTheDocumentedGates() {
+    func testEveryAccessCombinationKeepsOnlyMeetingEntitlementGated() {
         for hasCommercialLicense in [false, true] {
             for hasPremiumEntitlement in [false, true] {
                 for isSignedIn in [false, true] {
@@ -140,11 +137,11 @@ final class PremiumSettingsViewTests: XCTestCase {
                         )
                         XCTAssertEqual(
                             snapshot.requirement(for: .correctionLearning) == .available,
-                            hasCommercialLicense
+                            true
                         )
                         XCTAssertEqual(
                             snapshot.requirement(for: .cloudSync) == .available,
-                            hasPremiumEntitlement && isSignedIn
+                            true
                         )
 
                         if !hasCommercialLicense && !hasPremiumEntitlement {
@@ -153,8 +150,8 @@ final class PremiumSettingsViewTests: XCTestCase {
                                 isSupporter ? .supporterOnly : .locked
                             )
                             XCTAssertEqual(snapshot.action(for: .calendarMeeting), .none)
-                            XCTAssertEqual(snapshot.action(for: .correctionLearning), .none)
-                            XCTAssertEqual(snapshot.action(for: .cloudSync), .none)
+                            XCTAssertEqual(snapshot.action(for: .correctionLearning), .openSettings(.correctionLearning))
+                            XCTAssertEqual(snapshot.action(for: .cloudSync), .openSettings(.cloudSync))
                         }
                     }
                 }
