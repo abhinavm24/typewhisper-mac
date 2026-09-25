@@ -1,0 +1,147 @@
+name: Sync upstream & build personal DMG
+
+on:
+  push:
+    branches: [main]
+  pull_request_target:
+    types: [opened, reopened, synchronize, closed, edited]
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even if these inputs already have a successful release
+        type: boolean
+        default: false
+
+permissions: {}
+concurrency:
+  # Two native concurrency slots; each new run replaces the older run in its slot.
+  group: >-
+    personal-integration-${{ endsWith(format('{0}', github.run_number), '0') ||
+    endsWith(format('{0}', github.run_number), '2') ||
+    endsWith(format('{0}', github.run_number), '4') ||
+    endsWith(format('{0}', github.run_number), '6') ||
+    endsWith(format('{0}', github.run_number), '8') }}
+  cancel-in-progress: true
+
+jobs:
+  assemble:
+    if: github.repository == 'abhinavm24/typewhisper-mac' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: read
+    outputs:
+      build: ${{ steps.assemble.outputs.build }}
+      candidate: ${{ steps.assemble.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Test trusted orchestration
+        run: python3 -m unittest discover -s control/.github/personal-integration -p 'test_*.py' -v
+      - name: Snapshot and merge open PRs
+        id: assemble
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          FORCE: ${{ inputs.force || false }}
+        shell: bash
+        run: |
+          args=()
+          if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then args+=(--sync); fi
+          if [[ "$FORCE" == true ]]; then args+=(--force); fi
+          python3 control/.github/personal-integration/integrate.py assemble \
+            --control control --work "$RUNNER_TEMP/assembly" --output assembly "${args[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.assemble.outputs.build == 'true'
+        with:
+          name: personal-source
+          path: assembly/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: assemble
+    if: needs.assemble.outputs.build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [app-tests, sdk-tests, dmg]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-source
+          path: assembly
+      - name: Check out exact assembled candidate
+        env:
+          CANDIDATE: ${{ needs.assemble.outputs.candidate }}
+        run: |
+          git init candidate
+          git -C candidate fetch "$GITHUB_WORKSPACE/assembly/candidate.bundle" HEAD
+          git -C candidate checkout --detach FETCH_HEAD
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE"
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Run ${{ matrix.task }}
+        env:
+          BUILD_TASK: ${{ matrix.task }}
+        run: bash control/.github/personal-integration/build.sh "$GITHUB_WORKSPACE/candidate" "$GITHUB_WORKSPACE/products" "$BUILD_TASK"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.task == 'dmg'
+        with:
+          name: personal-dmg
+          path: products/TypeWhisper-personal.dmg
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: personal-${{ matrix.task }}-logs
+          path: products/*.log
+          retention-days: 14
+
+  publish:
+    needs: [assemble, build]
+    concurrency:
+      group: personal-integration-publish
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-source
+          path: assembly
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-dmg
+          path: products
+      - name: Verify inputs and publish personal prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 control/.github/personal-integration/integrate.py publish \
+            --control control --work "$RUNNER_TEMP/publication" --source assembly --assets products
