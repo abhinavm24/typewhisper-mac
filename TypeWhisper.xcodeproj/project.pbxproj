@@ -36,6 +36,7 @@
 		CA2E00000000000000000008 /* CalendarMeetingRecordingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA2F00000000000000000008 /* CalendarMeetingRecordingTests.swift */; };
 		CA2E00000000000000000009 /* MeetingAutomationCountdownIndicatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA2F00000000000000000009 /* MeetingAutomationCountdownIndicatorTests.swift */; };
 		CA2E0000000000000000000A /* PremiumSettingsViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA2F0000000000000000000A /* PremiumSettingsViewTests.swift */; };
+		4C4600000000000000000003 /* LocalFeatureAccessTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C4600000000000000000004 /* LocalFeatureAccessTests.swift */; };
 		CA3E00000000000000000001 /* PremiumFeatureOverview.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3F00000000000000000001 /* PremiumFeatureOverview.swift */; };
 		CA3E00000000000000000002 /* PremiumSettingsWindowManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3F00000000000000000002 /* PremiumSettingsWindowManager.swift */; };
 		CA3E00000000000000000003 /* PremiumSettingsWindowManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3F00000000000000000003 /* PremiumSettingsWindowManagerTests.swift */; };
@@ -565,6 +566,7 @@
 		F1177F582D186041B081F9C6 /* Localizable.xcstrings in Resources */ = {isa = PBXBuildFile; fileRef = 1D584661B6B55F6329CB5FC5 /* Localizable.xcstrings */; };
 		F774802B61AFC0DCA9E8E668 /* TypeWhisperPluginSDK in Frameworks */ = {isa = PBXBuildFile; productRef = 67BE633BCFA1507F72199015 /* TypeWhisperPluginSDK */; };
 		AA00000000000000000300 /* LicenseService.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB00000000000000000286 /* LicenseService.swift */; };
+		4C4600000000000000000001 /* LocalFeatureAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4C4600000000000000000002 /* LocalFeatureAccess.swift */; };
 		AA00000000000000000301 /* LicenseSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB00000000000000000287 /* LicenseSettingsView.swift */; };
 		AA00000000000000000302 /* WelcomeSheet.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB00000000000000000288 /* WelcomeSheet.swift */; };
 		AA00000000000000000303 /* SupporterBadgeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB00000000000000000289 /* SupporterBadgeView.swift */; };
@@ -714,6 +716,7 @@
 		CA2F00000000000000000008 /* CalendarMeetingRecordingTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = CalendarMeetingRecordingTests.swift; sourceTree = "<group>"; };
 		CA2F00000000000000000009 /* MeetingAutomationCountdownIndicatorTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = MeetingAutomationCountdownIndicatorTests.swift; sourceTree = "<group>"; };
 		CA2F0000000000000000000A /* PremiumSettingsViewTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PremiumSettingsViewTests.swift; sourceTree = "<group>"; };
+		4C4600000000000000000004 /* LocalFeatureAccessTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = LocalFeatureAccessTests.swift; sourceTree = "<group>"; };
 		CA3F00000000000000000001 /* PremiumFeatureOverview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PremiumFeatureOverview.swift; sourceTree = "<group>"; };
 		CA3F00000000000000000002 /* PremiumSettingsWindowManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PremiumSettingsWindowManager.swift; sourceTree = "<group>"; };
 		CA3F00000000000000000003 /* PremiumSettingsWindowManagerTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = PremiumSettingsWindowManagerTests.swift; sourceTree = "<group>"; };
@@ -1209,6 +1212,7 @@
 		BB00000000000000000276 /* Localizable.xcstrings */ = {isa = PBXFileReference; lastKnownFileType = text.json.xcstrings; path = Localizable.xcstrings; sourceTree = "<group>"; };
 		BB00000000000000000277 /* OpenRouterPlugin.bundle */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = OpenRouterPlugin.bundle; sourceTree = BUILT_PRODUCTS_DIR; };
 		BB00000000000000000286 /* LicenseService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicenseService.swift; sourceTree = "<group>"; };
+		4C4600000000000000000002 /* LocalFeatureAccess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalFeatureAccess.swift; sourceTree = "<group>"; };
 		BB00000000000000000287 /* LicenseSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LicenseSettingsView.swift; sourceTree = "<group>"; };
 		BB00000000000000000288 /* WelcomeSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeSheet.swift; sourceTree = "<group>"; };
 		BB00000000000000000289 /* SupporterBadgeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SupporterBadgeView.swift; sourceTree = "<group>"; };
@@ -1923,6 +1927,7 @@
 				BB00000000000000000247 /* SpeechFeedbackService.swift */,
 				BB00000000000000000272 /* TermPackRegistryService.swift */,
 				BB00000000000000000286 /* LicenseService.swift */,
+				4C4600000000000000000002 /* LocalFeatureAccess.swift */,
 				D4A100000000000000000002 /* RecorderTranscriptionBuffer.swift */,
 			);
 			path = Services;
@@ -2831,6 +2836,7 @@
 				CA2F00000000000000000008 /* CalendarMeetingRecordingTests.swift */,
 				CA2F00000000000000000009 /* MeetingAutomationCountdownIndicatorTests.swift */,
 				CA2F0000000000000000000A /* PremiumSettingsViewTests.swift */,
+				4C4600000000000000000004 /* LocalFeatureAccessTests.swift */,
 				CA3F00000000000000000003 /* PremiumSettingsWindowManagerTests.swift */,
 				E6D200DCDD6580F443C5CE0A /* TypeWhisperIntegrationTests.swift */,
 				3A4B5C6D7E8F901234567891 /* AudioEngineRecoverySupportTests.swift */,
@@ -4720,6 +4726,7 @@
 				CA2E00000000000000000008 /* CalendarMeetingRecordingTests.swift in Sources */,
 				CA2E00000000000000000009 /* MeetingAutomationCountdownIndicatorTests.swift in Sources */,
 				CA2E0000000000000000000A /* PremiumSettingsViewTests.swift in Sources */,
+				4C4600000000000000000003 /* LocalFeatureAccessTests.swift in Sources */,
 				CA3E00000000000000000003 /* PremiumSettingsWindowManagerTests.swift in Sources */,
 				7EC0EFA7DA6597CAEA640448 /* TypeWhisperIntegrationTests.swift in Sources */,
 				24FFE19AC026C48AE32BCD7C /* AppFormatterServiceTests.swift in Sources */,
@@ -5010,6 +5017,7 @@
 				AA00000000000000000261 /* HotkeySettingsView.swift in Sources */,
 				AA00000000000000000262 /* AboutSettingsView.swift in Sources */,
 				AA00000000000000000300 /* LicenseService.swift in Sources */,
+				4C4600000000000000000001 /* LocalFeatureAccess.swift in Sources */,
 				AA00000000000000000301 /* LicenseSettingsView.swift in Sources */,
 				AA00000000000000000302 /* WelcomeSheet.swift in Sources */,
 				AA00000000000000000353 /* PostUpdatePromptCoordinator.swift in Sources */,

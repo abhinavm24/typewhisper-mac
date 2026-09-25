@@ -718,13 +718,24 @@ final class CloudFolderSyncController: ObservableObject {
     @Published var errorMessage: String?
     @Published var statusMessage: String?
 
+    private var hasPremiumAccountAccess: Bool {
+        premiumAccountService.isSignedIn && premiumAccountService.hasPremiumEntitlement
+    }
+
     var canUseSync: Bool {
-        AppConstants.isPremiumSyncSmokeTest
-            || (premiumAccountService.isSignedIn && premiumAccountService.hasPremiumEntitlement)
+        LocalFeatureAccess.canUseCloudSync(
+            mode: mode,
+            hasPremiumAccountAccess: hasPremiumAccountAccess,
+            isSmokeTest: AppConstants.isPremiumSyncSmokeTest
+        )
     }
 
     var availableModes: [PremiumSyncMode] {
-        automaticICloudAvailable ? PremiumSyncMode.allCases : [.off, .cloudFolder]
+        LocalFeatureAccess.availableCloudSyncModes(
+            automaticICloudAvailable: automaticICloudAvailable,
+            hasPremiumAccountAccess: hasPremiumAccountAccess,
+            isSmokeTest: AppConstants.isPremiumSyncSmokeTest
+        )
     }
 
     var selectedFolderDisplayName: String {
@@ -820,7 +831,7 @@ final class CloudFolderSyncController: ObservableObject {
     }
 
     func setMode(_ newMode: PremiumSyncMode) async {
-        guard automaticICloudAvailable || newMode != .automaticICloud else { return }
+        guard availableModes.contains(newMode) else { return }
         guard newMode != mode, !isSyncing else { return }
         if isConfigured, canUseSync { await syncNow() }
         guard !isSyncing else { return }
@@ -1321,6 +1332,10 @@ final class CloudFolderSyncController: ObservableObject {
     func deletePrivateSyncFolder() async {
         guard !isSyncing else { return }
         let deletedMode = mode
+        guard deletedMode != .automaticICloud || hasPremiumAccountAccess else {
+            errorMessage = CloudFolderSyncError.notEntitled.localizedDescription
+            return
+        }
         guard let folderURL = activeFolderURL(for: deletedMode) else { return }
         scheduledSyncTask?.cancel()
         scheduledSyncTask = nil
@@ -1495,7 +1510,7 @@ struct CloudFolderSyncSettingsView: View {
                     } label: {
                         Label(String(localized: "premium.window.sync.deleteData"), systemImage: "trash")
                     }
-                    .disabled(!controller.isConfigured || controller.isSyncing)
+                    .disabled(!controller.isConfigured || !controller.canUseSync || controller.isSyncing)
                     .accessibilityIdentifier("premium.sync.deleteData")
                 }
             }
@@ -1558,6 +1573,9 @@ struct CloudFolderSyncSettingsView: View {
     }
 
     private var statusText: String {
+        if controller.mode == .automaticICloud, !controller.canUseSync {
+            return String(localized: "premium.hub.status.actionRequired")
+        }
         if controller.isSyncing {
             return String(localized: "premium.window.sync.syncing")
         }
@@ -1565,6 +1583,9 @@ struct CloudFolderSyncSettingsView: View {
     }
 
     private var statusColor: Color {
+        if controller.mode == .automaticICloud, !controller.canUseSync {
+            return .orange
+        }
         if controller.isSyncing {
             return .blue
         }
