@@ -77,9 +77,9 @@
 		<true/>
 	</dict>
 	<key>SUFeedURL</key>
-	<string>https://typewhisper.github.io/typewhisper-mac/appcast.xml</string>
+	<string>$(TYPEWHISPER_PERSONAL_UPDATE_FEED_URL)</string>
 	<key>SUPublicEDKey</key>
-	<string>OdAMiN136Ckglxnq4FeLagPjcrZiASYGaeUWBkK6tuc=</string>
+	<string>$(TYPEWHISPER_PERSONAL_UPDATE_PUBLIC_KEY)</string>
 	<key>TypeWhisperReleaseChannel</key>
 	<string>$(TYPEWHISPER_RELEASE_CHANNEL)</string>
 	<key>TypeWhisperReleaseTag</key>

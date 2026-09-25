@@ -8,7 +8,13 @@ case "$task" in app-tests|sdk-tests|dmg) ;; *) echo "Unknown build task: $task" 
 mkdir -p "$products"
 cd "$source_dir"
 common=(-skipPackagePluginValidation -project TypeWhisper.xcodeproj -scheme TypeWhisper
-  -derivedDataPath build-personal CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO)
+  -derivedDataPath build-personal CODE_SIGN_IDENTITY=- CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO
+  "CURRENT_PROJECT_VERSION=$GITHUB_RUN_NUMBER.$GITHUB_RUN_ATTEMPT"
+  "TYPEWHISPER_PERSONAL_UPDATE_FEED_URL=${PERSONAL_UPDATE_FEED_URL:-https://abhinavm24.github.io/typewhisper-mac/appcast.xml}"
+  "TYPEWHISPER_PERSONAL_UPDATE_PUBLIC_KEY=${PERSONAL_UPDATE_PUBLIC_KEY:-}")
+if [[ "${PERSONAL_UPDATES_ENABLED:-false}" == true ]]; then
+  : "${PERSONAL_UPDATE_PUBLIC_KEY:?Configure the public update key before enabling updates}"
+fi
 
 if [[ "$task" == sdk-tests ]]; then
   swift test --package-path TypeWhisperPluginSDK 2>&1 | tee "$products/sdk-tests.log"
@@ -25,6 +31,8 @@ if [[ "$task" == app-tests ]]; then
   bash scripts/check_first_party_warnings.sh "$products/app-tests.log"
   if [[ -f scripts/test_install_local.py ]]; then python3 scripts/test_install_local.py; fi
   if [[ -f scripts/test_update_personal.py ]]; then python3 scripts/test_update_personal.py; fi
+  if [[ -f scripts/test_personal_appcast.py ]]; then python3 scripts/test_personal_appcast.py; fi
+  if [[ -f scripts/test_dev_signing.py ]]; then python3 scripts/test_dev_signing.py; fi
   exit 0
 fi
 bash scripts/check_release_binary_instrumentation.sh --self-test

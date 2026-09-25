@@ -6,6 +6,40 @@ import XCTest
 import TypeWhisperPluginSDK
 @testable import TypeWhisper
 
+final class PersonalUpdateConfigurationTests: XCTestCase {
+    private let key = Data(repeating: 7, count: 32).base64EncodedString()
+    private let feed = "https://abhinavm24.github.io/typewhisper-mac/appcast.xml"
+
+    func testPersonalFeedRequiresOwnedKeyAndHTTPS() {
+        XCTAssertTrue(PersonalUpdateConfiguration.isConfigured(infoDictionary: ["SUFeedURL": feed, "SUPublicEDKey": key]))
+        XCTAssertFalse(PersonalUpdateConfiguration.isConfigured(infoDictionary: [
+            "SUFeedURL": feed, "SUPublicEDKey": key, "CFBundleIdentifier": "com.typewhisper.mac.dev"
+        ]))
+        XCTAssertFalse(PersonalUpdateConfiguration.isConfigured(infoDictionary: nil))
+        for invalidKey in ["", "$(TYPEWHISPER_PERSONAL_UPDATE_PUBLIC_KEY)", "invalid", Data(repeating: 1, count: 31).base64EncodedString()] {
+            XCTAssertFalse(PersonalUpdateConfiguration.isConfigured(infoDictionary: ["SUFeedURL": feed, "SUPublicEDKey": invalidKey]))
+        }
+        for invalidFeed in ["http://example.com/appcast.xml", "https://user:password@example.com/feed", "not a URL"] {
+            XCTAssertFalse(PersonalUpdateConfiguration.isConfigured(infoDictionary: ["SUFeedURL": invalidFeed, "SUPublicEDKey": key]))
+        }
+    }
+
+    func testUpstreamFeedAndSigningKeyAreRejected() {
+        XCTAssertFalse(PersonalUpdateConfiguration.isConfigured(infoDictionary: [
+            "SUFeedURL": "https://typewhisper.github.io/typewhisper-mac/appcast.xml", "SUPublicEDKey": key
+        ]))
+        XCTAssertFalse(PersonalUpdateConfiguration.isConfigured(infoDictionary: [
+            "SUFeedURL": feed, "SUPublicEDKey": "OdAMiN136Ckglxnq4FeLagPjcrZiASYGaeUWBkK6tuc="
+        ]))
+    }
+
+    func testBundledFeedExpandsToHTTPS() {
+        let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String
+        XCTAssertEqual(feed.flatMap(URL.init(string:))?.scheme, "https")
+        XCTAssertNotEqual(feed.flatMap(URL.init(string:))?.host, "typewhisper.github.io")
+    }
+}
+
 private func rtfAttributedStringContainsFontTrait(
     _ trait: NSFontTraitMask,
     in attributed: NSAttributedString,
