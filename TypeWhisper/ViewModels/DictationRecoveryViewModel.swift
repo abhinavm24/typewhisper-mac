@@ -257,7 +257,8 @@ final class DictationRecoveryViewModel: ObservableObject {
     }
 
     var canUseAutomaticFallback: Bool {
-        licenseService?.canUseProTranscriptionFallback ?? false
+        licenseService?.canUseProTranscriptionFallback
+            ?? LocalFeatureAccess.automaticTranscriptionFallback
     }
 
     var automaticFallbackUnavailableMessage: String? {

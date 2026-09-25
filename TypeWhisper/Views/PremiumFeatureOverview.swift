@@ -116,8 +116,13 @@ struct PremiumFeatureAccessSnapshot: Equatable, Sendable {
         case .calendarMeeting:
             return hasAnyPremiumAccess ? .available : .commercialOrPremiumAccount
         case .correctionLearning:
-            return hasCommercialLicense ? .available : .commercialLicense
+            return LocalFeatureAccess.correctionLearning || hasCommercialLicense
+                ? .available
+                : .commercialLicense
         case .cloudSync:
+            if LocalFeatureAccess.customFolderSync {
+                return .available
+            }
             guard hasPremiumEntitlement else {
                 return hasCommercialLicense && isSignedIn
                     ? .linkCommercialLicense
@@ -128,8 +133,9 @@ struct PremiumFeatureAccessSnapshot: Equatable, Sendable {
     }
 
     func action(for feature: PremiumFeatureID) -> PremiumFeatureCardAction {
-        guard hasAnyPremiumAccess else { return .none }
-        guard requirement(for: feature) == .available else { return .manageAccess }
+        guard requirement(for: feature) == .available else {
+            return hasAnyPremiumAccess ? .manageAccess : .none
+        }
 
         switch feature {
         case .calendarMeeting:
@@ -427,6 +433,9 @@ struct PremiumActiveFeatureOverview: View {
     }
 
     private var calendarPreviewLines: [String] {
+        guard access.requirement(for: .calendarMeeting) == .available else {
+            return [String(localized: "premium.hub.calendar.providersPreview")]
+        }
         let permission: String
         switch calendarController.calendarAuthorization {
         case .fullAccess:
@@ -468,6 +477,9 @@ struct PremiumActiveFeatureOverview: View {
     private var syncStatus: String {
         let requirement = access.requirement(for: .cloudSync)
         guard requirement == .available else { return requirementStatus(requirement) }
+        if syncController.mode == .automaticICloud, !syncController.canUseSync {
+            return String(localized: "premium.hub.status.actionRequired")
+        }
         if syncController.isSyncing {
             return String(localized: "premium.window.sync.syncing")
         }
@@ -483,6 +495,9 @@ struct PremiumActiveFeatureOverview: View {
 
     private var syncStatusTone: PremiumFeatureStatusTone {
         guard access.requirement(for: .cloudSync) == .available else { return .warning }
+        if syncController.mode == .automaticICloud, !syncController.canUseSync {
+            return .warning
+        }
         if syncController.isSyncing { return .accent }
         return syncController.mode == .off ? .secondary : .success
     }
