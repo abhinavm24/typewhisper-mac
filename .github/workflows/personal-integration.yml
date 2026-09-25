@@ -100,6 +100,9 @@ jobs:
       - name: Run ${{ matrix.task }}
         env:
           BUILD_TASK: ${{ matrix.task }}
+          PERSONAL_UPDATES_ENABLED: ${{ vars.PERSONAL_UPDATES_ENABLED || 'false' }}
+          PERSONAL_UPDATE_FEED_URL: ${{ vars.PERSONAL_UPDATE_FEED_URL || 'https://abhinavm24.github.io/typewhisper-mac/appcast.xml' }}
+          PERSONAL_UPDATE_PUBLIC_KEY: ${{ vars.PERSONAL_UPDATES_ENABLED == 'true' && vars.PERSONAL_UPDATE_PUBLIC_KEY || '' }}
         run: bash control/.github/personal-integration/build.sh "$GITHUB_WORKSPACE/candidate" "$GITHUB_WORKSPACE/products" "$BUILD_TASK"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: matrix.task == 'dmg'
@@ -145,3 +148,62 @@ jobs:
         run: |
           python3 control/.github/personal-integration/integrate.py publish \
             --control control --work "$RUNNER_TEMP/publication" --source assembly --assets products
+
+  update-feed:
+    needs: [assemble, build, publish]
+    if: needs.assemble.outputs.build == 'true' && vars.PERSONAL_UPDATES_ENABLED == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    concurrency:
+      group: personal-update-feed
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-source
+          path: assembly
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-dmg
+          path: products
+      - name: Prepare hash-verified Sparkle tools without credentials
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'control/scripts')
+          from prepare_release_tools import prepare_sparkle, sparkle_lock
+          directory = Path(os.environ['RUNNER_TEMP']) / 'personal-sparkle'
+          directory.mkdir()
+          prepare_sparkle(directory, sparkle_lock(Path('control')))
+          PY
+          swift control/scripts/verify_personal_update.swift --self-test
+      - name: Sign and publish the personal appcast
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERSONAL_SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONAL_SPARKLE_PRIVATE_KEY }}
+          PERSONAL_UPDATE_PUBLIC_KEY: ${{ vars.PERSONAL_UPDATE_PUBLIC_KEY }}
+        run: |
+          bash control/.github/personal-integration/publish-feed.sh \
+            "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/assembly" "$GITHUB_WORKSPACE/products" \
+            "$RUNNER_TEMP/personal-sparkle/sparkle/bin/sign_update"
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          name: personal-appcast-${{ github.run_id }}-${{ github.run_attempt }}
+          path: products/appcast
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        id: deploy
+        with:
+          artifact_name: personal-appcast-${{ github.run_id }}-${{ github.run_attempt }}
