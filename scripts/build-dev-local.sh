@@ -79,7 +79,9 @@ trash_if_present() {
 
 write_build_marker() {
   local app="$1"
-  local marker="$app/Contents/Resources/DevBuildSource.txt"
+  # Keep diagnostics outside the signed bundle: adding a resource after Xcode
+  # signs the app invalidates that signature.
+  local marker="$app.build-source.txt"
   local branch commit built_at
 
   branch="$(git -C "$repo_root" branch --show-current 2>/dev/null || true)"
@@ -114,14 +116,19 @@ trash_stale_dev_apps() {
 
 quit_running_typewhisper
 
+# Adapted from CarbonoDev/typewhisper-mac#1 (marcorivm).
+signing_args=(CODE_SIGN_IDENTITY='-' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO)
+if [[ -s "$repo_root/CodeSigning.local.xcconfig" ]]; then
+  log "signing with CodeSigning.local.xcconfig identity"
+  signing_args=(-allowProvisioningUpdates)
+fi
+
 xcodebuild build \
   -project "$repo_root/TypeWhisper.xcodeproj" \
   -scheme TypeWhisper \
   -destination 'platform=macOS,arch=arm64' \
   -derivedDataPath "$derived_data_path" \
-  CODE_SIGN_IDENTITY='-' \
-  CODE_SIGNING_REQUIRED=NO \
-  CODE_SIGNING_ALLOWED=NO
+  "${signing_args[@]}"
 
 "$repo_root/scripts/sync-dev-data-local.sh"
 
@@ -139,6 +146,9 @@ trash_if_present "$installed_app"
 ditto "$app_path" "$installed_app"
 write_build_marker "$installed_app"
 xattr -cr "$installed_app" >/dev/null 2>&1 || true
+if [[ -s "$repo_root/CodeSigning.local.xcconfig" ]]; then
+  codesign --verify --deep --strict "$installed_app"
+fi
 
 trash_stale_dev_apps "$installed_app"
 
