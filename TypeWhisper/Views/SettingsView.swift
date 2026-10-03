@@ -3,7 +3,7 @@ import AppKit
 import TypeWhisperPluginSDK
 
 enum SettingsTab: Hashable {
-    case home, general, appearance, dictation, transform, hotkeys, recorder
+    case home, general, appearance, dictation, hotkeys, recorder
     case dictationRecovery, fileTranscription, history, statistics, dictionary, snippets, workflows, profiles, prompts, premium, integrations, advanced, license, about
     case plugin(pluginId: String, itemId: String)
     case installedPlugin(pluginId: String)
@@ -50,7 +50,6 @@ struct SettingsView: View {
         case "indicator": return .home
         case "recording": return .dictation
         case "recovery": return .dictationRecovery
-        case "transform": return .transform
         case "hotkeys": return .hotkeys
         case "file-transcription": return .fileTranscription
         case "recorder": return .recorder
@@ -75,7 +74,6 @@ struct SettingsView: View {
             SettingsDestination(tab: .general, title: String(localized: "General"), systemImage: "gear", badge: nil),
             SettingsDestination(tab: .appearance, title: String(localized: "Appearance"), systemImage: "circle.lefthalf.filled", badge: nil),
             SettingsDestination(tab: .dictation, title: String(localized: "Dictation"), systemImage: "mic.fill", badge: nil),
-            SettingsDestination(tab: .transform, title: "Transform", systemImage: "wand.and.stars", badge: nil),
             SettingsDestination(tab: .hotkeys, title: String(localized: "Hotkeys"), systemImage: "keyboard", badge: nil),
             SettingsDestination(
                 tab: .recorder,
@@ -296,8 +294,6 @@ struct SettingsView: View {
             AppearanceSettingsView()
         case .dictation:
             RecordingSettingsView()
-        case .transform:
-            VoiceTransformSettingsView()
         case .hotkeys:
             HotkeySettingsView()
         case .recorder:
@@ -661,8 +657,7 @@ private func settingsDestinationSections(_ destinations: [SettingsDestination]) 
     var coreDestinations = [
         settingsDestination(destinations, .general),
         settingsDestination(destinations, .appearance),
-        settingsDestination(destinations, .dictation),
-        settingsDestination(destinations, .transform)
+        settingsDestination(destinations, .dictation)
     ]
     if let recoveryDestination = settingsDestinationIfAvailable(destinations, .dictationRecovery) {
         coreDestinations.append(recoveryDestination)

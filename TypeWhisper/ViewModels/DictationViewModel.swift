@@ -251,7 +251,6 @@ final class DictationViewModel: ObservableObject {
         }
     }
     @Published var audioLevel: Float = 0
-    var voiceTransformIsBusy: () -> Bool = { false }
     @Published var recordingDuration: TimeInterval = 0
     @Published var hotkeyMode: HotkeyService.HotkeyMode?
     @Published var partialText: String = ""
@@ -937,7 +936,7 @@ final class DictationViewModel: ObservableObject {
     }
 
     var canStartAPIRecording: Bool {
-        state == .idle && !voiceTransformIsBusy()
+        state == .idle
     }
 
     var activeWorkflowId: UUID? {
@@ -1683,16 +1682,17 @@ final class DictationViewModel: ObservableObject {
         }
     }
 
+    var workflowVoiceEditingIsBusy: () -> Bool = { false }
+    var onWorkflowVoiceEditing: ((Workflow, WorkflowVoiceEditingTarget?) -> Void)? {
+        didSet { promptPaletteHandler.onWorkflowVoiceEditing = onWorkflowVoiceEditing }
+    }
+
     private func startRecording(
         forcedWorkflowId: UUID? = nil,
         sessionID: UUID = UUID(),
         requestUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
-        guard !voiceTransformIsBusy() else {
-            hotkeyService.cancelDictation()
-            return
-        }
-        guard state == .idle else {
+        guard state == .idle, !workflowVoiceEditingIsBusy() else {
             logger.warning("startRecording rejected: state=\(String(describing: self.state), privacy: .public); resetting hotkey state")
             hotkeyService.cancelDictation()
             return
@@ -4413,16 +4413,20 @@ final class DictationViewModel: ObservableObject {
     }
 
     func triggerWorkflowPalette() {
-        guard !voiceTransformIsBusy() else { return }
+        guard !workflowVoiceEditingIsBusy() else { return }
         recentTranscriptionPaletteHandler.hide()
         promptPaletteHandler.triggerSelection(currentState: state, soundFeedbackEnabled: soundFeedbackEnabled)
     }
 
     func processWorkflowHotkeyText(workflowId: UUID) {
-        guard !voiceTransformIsBusy() else { return }
         recentTranscriptionPaletteHandler.hide()
         promptPaletteHandler.hide()
         guard let workflow = workflowService.workflow(id: workflowId) else { return }
+        if workflow.usesVoiceEditing {
+            onWorkflowVoiceEditing?(workflow, nil)
+            return
+        }
+        guard !workflowVoiceEditingIsBusy() else { return }
         promptPaletteHandler.processWorkflowDirectly(
             workflow: workflow,
             currentState: state,
