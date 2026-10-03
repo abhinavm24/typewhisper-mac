@@ -97,6 +97,7 @@ enum HotkeySlotType: String, CaseIterable, Sendable {
     case pushToTalk
     case toggle
     case promptPalette
+    case voiceTransform
     case recentTranscriptions
     case copyLastTranscription
     case pasteLastTranscription
@@ -110,6 +111,7 @@ enum HotkeySlotType: String, CaseIterable, Sendable {
         case .pushToTalk: return UserDefaultsKeys.pttHotkey
         case .toggle: return UserDefaultsKeys.toggleHotkey
         case .promptPalette: return UserDefaultsKeys.promptPaletteHotkey
+        case .voiceTransform: return UserDefaultsKeys.voiceTransformHotkey
         case .recentTranscriptions: return UserDefaultsKeys.recentTranscriptionsHotkey
         case .copyLastTranscription: return UserDefaultsKeys.copyLastTranscriptionHotkey
         case .pasteLastTranscription: return UserDefaultsKeys.pasteLastTranscriptionHotkey
@@ -125,6 +127,7 @@ enum HotkeySlotType: String, CaseIterable, Sendable {
         case .pushToTalk: return UserDefaultsKeys.pttHotkeys
         case .toggle: return UserDefaultsKeys.toggleHotkeys
         case .promptPalette: return UserDefaultsKeys.promptPaletteHotkeys
+        case .voiceTransform: return UserDefaultsKeys.voiceTransformHotkeys
         case .recentTranscriptions: return UserDefaultsKeys.recentTranscriptionsHotkeys
         case .copyLastTranscription: return UserDefaultsKeys.copyLastTranscriptionHotkeys
         case .pasteLastTranscription: return UserDefaultsKeys.pasteLastTranscriptionHotkeys
@@ -142,7 +145,7 @@ extension HotkeySlotType {
         switch self {
         case .hybrid, .pushToTalk, .toggle:
             true
-        case .promptPalette, .recentTranscriptions, .copyLastTranscription, .pasteLastTranscription, .recorderToggle,
+        case .promptPalette, .voiceTransform, .recentTranscriptions, .copyLastTranscription, .pasteLastTranscription, .recorderToggle,
              .undoLastDictation, .restoreRawTranscript:
             false
         }
@@ -217,6 +220,13 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     var onDictationStart: ((UInt64) -> Void)?
     var onDictationStop: (() -> Void)?
     var onPromptPaletteToggle: (() -> Void)?
+    var onVoiceTransformToggle: (() -> Void)?
+    var onVoiceTransformCancel: (() -> Void)?
+    private let voiceTransformCancellationAvailable = OSAllocatedUnfairLock(initialState: false)
+    var isVoiceTransformCancellationAvailable: Bool {
+        get { voiceTransformCancellationAvailable.withLock { $0 } }
+        set { voiceTransformCancellationAvailable.withLock { $0 = newValue } }
+    }
     var onRecentTranscriptionsToggle: (() -> Void)?
     var onCopyLastTranscription: (() -> Void)?
     var onPasteLastTranscription: (() -> Void)?
@@ -1556,7 +1566,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         if event.type == .keyDown && event.keyCode == Self.escapeKeyCode {
             cancelPendingHybridModifierHold()
             if isEscapeKeySuppressed { return true }
-            if !isCancellationAvailable {
+            if !isCancellationAvailable && !isVoiceTransformCancellationAvailable {
                 // Disabled mode: Escape is never ours. Pass it straight through
                 // to the foreground app before the push-to-talk interruption
                 // check and slot matching, so it can neither discard a
@@ -1568,7 +1578,11 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             isEscapeKeySuppressed = true
             // The press latch deduplicates fallback delivery without dropping a quick second press.
             performHotkeyAction(source: source) { [weak self] in
-                self?.onCancelPressed?()
+                if self?.isVoiceTransformCancellationAvailable == true && self?.isCancellationAvailable != true {
+                    self?.onVoiceTransformCancel?()
+                } else {
+                    self?.onCancelPressed?()
+                }
             }
             return true
         }
@@ -2591,6 +2605,10 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         hotkey: UnifiedHotkey,
         requestTimestamp: UInt64 = HotkeyService.requestTimestamp()
     ) {
+        if slotType == .voiceTransform {
+            onVoiceTransformToggle?()
+            return
+        }
         if slotType == .promptPalette {
             onPromptPaletteToggle?()
             return
@@ -2688,6 +2706,8 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
         case .toggle:
             break
         case .promptPalette:
+            break // handled on keyDown only
+        case .voiceTransform:
             break // handled on keyDown only
         case .recentTranscriptions:
             break // handled on keyDown only
