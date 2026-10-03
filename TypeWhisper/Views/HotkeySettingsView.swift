@@ -119,7 +119,7 @@ struct HotkeySettingsView: View {
     }
 }
 
-struct MultiHotkeySlotRecorder: View {
+private struct MultiHotkeySlotRecorder: View {
     @ObservedObject private var dictation = DictationViewModel.shared
 
     let slot: HotkeySlotType

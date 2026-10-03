@@ -131,11 +131,19 @@ final class SettingsBackupExporterTests: XCTestCase {
             trigger: .app("com.apple.mail"),
             output: WorkflowOutput(autoEnterMode: .duringDictation)
         )
+        source.workflowService.addWorkflow(
+            name: "Voice edit selected text", template: .custom, trigger: .manual(),
+            behavior: WorkflowBehavior(settings: ["instruction": "Improve email"], voiceEditingEnabled: true)
+        )
         source.dictionaryService.addEntry(type: .term, original: "Kubernetes")
         source.dictionaryService.addEntry(type: .correction, original: "teh", replacement: "the")
         source.snippetService.addSnippet(trigger: ";sig", replacement: "Best, Alex")
-        source.snippetService.addSnippet(trigger: "my rewrite", replacement: "Be concise", scope: .voiceTransform)
 
+        source.snippetService.connectLegacyVoiceEditingMigration(to: source.workflowService)
+        try source.snippetService.applyUserDataSyncMutations([.upsertSnippet(.init(
+            trigger: "Old transform prompt", replacement: "Be concise", caseSensitive: false, isEnabled: true,
+            createdAt: Date(), updatedAt: Date(), scopeRawValue: "voiceTransform"
+        ))])
         let backup = try SettingsBackupExporter.buildBackup(
             workflowService: source.workflowService,
             dictionaryService: source.dictionaryService,
@@ -148,7 +156,12 @@ final class SettingsBackupExporterTests: XCTestCase {
         )
 
         let data = try SettingsBackupExporter.encodedJSON(backup)
-        let parsed = try SettingsBackupExporter.parse(data)
+        var legacyBackup = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        var legacySnippets = try XCTUnwrap(legacyBackup["snippets"] as? [[String: Any]])
+        legacySnippets.append(["trigger": "Backup transform prompt", "replacement": "Improve email",
+                               "caseSensitive": false, "isEnabled": true, "scopeRawValue": "voiceTransform"])
+        legacyBackup["snippets"] = legacySnippets
+        let parsed = try SettingsBackupExporter.parse(JSONSerialization.data(withJSONObject: legacyBackup))
 
         let destination = try makeFixture()
         defer { teardown(destination) }
@@ -167,16 +180,18 @@ final class SettingsBackupExporterTests: XCTestCase {
             userDefaults: destination.userDefaults
         )
 
-        XCTAssertEqual(result.workflowsImported, 1)
+        XCTAssertEqual(result.workflowsImported, 4)
         XCTAssertEqual(result.dictionaryImported, 2)
-        XCTAssertEqual(result.snippetsImported, 2)
+        XCTAssertEqual(result.snippetsImported, 1)
         XCTAssertEqual(destination.workflowService.workflows.first?.name, "Cleanup")
         XCTAssertEqual(destination.workflowService.workflows.first?.output.autoEnterMode, .duringDictation)
         XCTAssertEqual(destination.workflowService.workflows.first?.output.autoEnter, false)
         XCTAssertEqual(destination.snippetService.snippets.first?.trigger, ";sig")
-        XCTAssertEqual(destination.snippetService.snippets.first { $0.trigger == "my rewrite" }?.scope, .voiceTransform)
-        XCTAssertEqual(destination.snippetService.applySnippets(to: "my rewrite"), "my rewrite")
-        XCTAssertEqual(try destination.snippetService.resolveTransformInstruction("my rewrite").resolved, "Be concise")
+        XCTAssertEqual(destination.workflowService.workflows.first { $0.name == "Voice edit selected text" }?.behavior.voiceEditingEnabled, true)
+        XCTAssertEqual(destination.snippetService.snippets.count, 1)
+        XCTAssertEqual(backup.snippets.count, 1)
+        XCTAssertEqual(result.snippetsSkipped, 1)
+        XCTAssertTrue(destination.workflowService.workflows.first { $0.name == "Backup transform prompt" }?.usesVoiceEditing == true)
     }
 
     func testRoundTripPreservesSegmentedPostProcessingFlag() async throws {

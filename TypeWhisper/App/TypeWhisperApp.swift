@@ -832,9 +832,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         ServiceContainer.shared.hotkeyService.onPromptPaletteToggle = {
             DictationViewModel.shared.triggerWorkflowPalette()
         }
-        ServiceContainer.shared.hotkeyService.onVoiceTransformToggle = {
-            ServiceContainer.shared.voiceTransformCoordinator.toggleRecording()
-        }
         ServiceContainer.shared.hotkeyService.onRecentTranscriptionsToggle = {
             DictationViewModel.shared.triggerRecentTranscriptionsPalette()
         }
