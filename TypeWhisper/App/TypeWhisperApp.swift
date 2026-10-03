@@ -740,7 +740,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private var hasInteractiveForegroundContent = false
     private var pluginScreenshotCaptureController: PluginSettingsScreenshotCaptureController?
     private let finderTranscriptionService = FinderTranscriptionService()
-    private lazy var updaterController = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
+    private lazy var updaterController = SPUStandardUpdaterController(
+        startingUpdater: PersonalUpdateConfiguration.isConfigured(),
+        updaterDelegate: self,
+        userDriverDelegate: nil
+    )
 
     var updateChecker: UpdateChecker {
         .sparkle(updaterController.updater)
