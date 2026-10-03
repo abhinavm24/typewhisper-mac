@@ -1275,7 +1275,7 @@ final class FileTranscriptionViewModelTests: XCTestCase {
         )
     }
 
-    func testRecoveryAutomaticFallbackRequiresCommercialOrSupporterAccess() throws {
+    func testRecoveryAutomaticFallbackDoesNotRequireCommercialOrSupporterAccess() throws {
         setupPluginManager()
         let defaults = try makeDefaults()
         let license = LicenseService(defaults: defaults)
@@ -1285,7 +1285,10 @@ final class FileTranscriptionViewModelTests: XCTestCase {
         viewModel.selectedModel = "backup-large"
         viewModel.automaticFallbackEnabled = true
 
-        XCTAssertNil(viewModel.automaticFallbackConfiguration(excluding: "primary", task: .transcribe))
+        XCTAssertEqual(
+            viewModel.automaticFallbackConfiguration(excluding: "primary", task: .transcribe),
+            DictationRecoveryFallbackConfiguration(engineId: "backup", modelId: "backup-large")
+        )
 
         license.licenseStatus = .active
         license.licenseTier = .individual

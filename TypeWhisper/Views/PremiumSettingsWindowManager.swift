@@ -301,9 +301,7 @@ struct PremiumCloudSyncSettingsWindow: View {
     }
 
     var body: some View {
-        if premiumAccount.isSignedIn,
-           premiumAccount.hasPremiumEntitlement,
-           syncController.canUseSync {
+        if LocalFeatureAccess.customFolderSync || syncController.canUseSync {
             CloudFolderSyncSettingsView(controller: syncController)
         } else {
             PremiumLockedDetailView(
