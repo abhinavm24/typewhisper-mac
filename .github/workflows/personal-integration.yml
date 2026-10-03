@@ -1,12 +1,6 @@
-name: Sync upstream & build personal DMG
+name: Build personal DMG on demand
 
 on:
-  push:
-    branches: [main]
-  pull_request_target:
-    types: [opened, reopened, synchronize, closed, edited]
-  schedule:
-    - cron: '17 2 * * *'
   workflow_dispatch:
     inputs:
       force:
@@ -48,12 +42,10 @@ jobs:
         id: assemble
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
           FORCE: ${{ inputs.force || false }}
         shell: bash
         run: |
           args=()
-          if [[ "$EVENT_NAME" == schedule || "$EVENT_NAME" == workflow_dispatch ]]; then args+=(--sync); fi
           if [[ "$FORCE" == true ]]; then args+=(--force); fi
           python3 control/.github/personal-integration/integrate.py assemble \
             --control control --work "$RUNNER_TEMP/assembly" --output assembly "${args[@]}"
