@@ -13,6 +13,8 @@ BUILD_MARKER := $(BUILD_DIR)/.typewhisper-build-dir
 BUILD_COMPLETE_MARKER := $(BUILD_DIR)/.typewhisper-build-complete
 XCODEBUILD ?= xcodebuild
 INSTALL_SUDO ?= sudo
+PERSONAL_REPO := abhinavm24/typewhisper-mac
+FORCE ?= false
 # "auto" uses the first valid Apple Development certificate in the login
 # keychain. Set this to a certificate name/hash, or "-" to force ad-hoc signing.
 LOCAL_SIGNING_IDENTITY ?= auto
@@ -24,11 +26,14 @@ XCODE_COMMON := -skipPackagePluginValidation \
 	CODE_SIGNING_REQUIRED=NO \
 	CODE_SIGNING_ALLOWED=NO
 
-.PHONY: help require-non-root prepare-build-dir require-built-app build dmg test test-sdk test-install test-update-personal check update update-local install install-dry-run reinstall run clean
+.PHONY: help sync-main release require-non-root prepare-build-dir require-built-app build dmg test test-sdk test-install test-update-personal test-sync-main check update update-local install install-dry-run reinstall run clean
 
 help:
 	@printf '%s\n' \
 		'TypeWhisper local development commands:' \
+		'  make sync-main        On clean main, fetch fork main and merge upstream locally' \
+		'  make release          Trigger personal CI from pushed main and open PRs' \
+		'  make release FORCE=true  Rebuild inputs that already have a release' \
 		'  make update           Download and install the latest personal CI release' \
 		'  make build            Build and sign the app into build-local-<uid>/' \
 		'  make dmg              Package the completed app as a shareable local DMG' \
@@ -50,6 +55,14 @@ help:
 		'' \
 		'Workflow: run "make build", then "make install".' \
 		'Do not run make with sudo; make install elevates only the app replacement.'
+
+sync-main:
+	bash scripts/sync_main.sh
+
+release:
+	@case "$(FORCE)" in true|false) ;; *) echo 'error: FORCE must be true or false' >&2; exit 2 ;; esac
+	gh workflow run personal-integration.yml --repo "$(PERSONAL_REPO)" --ref main -f force="$(FORCE)"
+	@printf '%s\n' 'Personal CI requested. Follow progress at https://github.com/$(PERSONAL_REPO)/actions/workflows/personal-integration.yml' 'After it succeeds, run make update to install the release.'
 
 require-non-root:
 	@if [[ "$$(id -u)" -eq 0 ]]; then \
@@ -120,7 +133,10 @@ test-install:
 test-update-personal:
 	python3 scripts/test_update_personal.py
 
-check: test test-sdk test-install test-update-personal
+test-sync-main:
+	python3 scripts/test_sync_main.py
+
+check: test test-sdk test-install test-update-personal test-sync-main
 
 # Normal updates download a tested Release asset instead of compiling locally.
 update: require-non-root

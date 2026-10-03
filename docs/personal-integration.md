@@ -3,28 +3,45 @@
 This fork builds a personal app from `main` plus **all open PRs targeting this
 fork's `main`**, including drafts. PRs remain open. Their code is never merged
 into main by this workflow. Only owner-authored, same-repository PRs run
-automatically; an unexpected external PR stops assembly for review.
+on request; an unexpected external PR stops assembly for review.
 
-Push changes to a source PR branch to queue a build. Main pushes and PR
-opening/reopening/closing/retargeting also recompute the combination. Branches
-without an open PR are ignored. `personal-integration` is generated output:
-make fixes in the source PR, never directly on that branch.
+Releases run only on manual dispatch. There are no scheduled, push or PR-event
+triggers. Push source changes, then request a build when you want a release.
+Branches without an open PR are ignored. `personal-integration` is generated
+output: make fixes in the source PR, never directly on that branch.
 
-Every day at 02:17 UTC (07:47 India time), the workflow merges upstream main
-into fork main, preserving the fork's CI files, then builds the open PRs. A
-manual run performs the same upstream sync:
+Sync upstream locally first so you can resolve conflicts before running CI.
+From a clean checkout of `main`:
 
 ```sh
-gh workflow run personal-integration.yml --repo abhinavm24/typewhisper-mac --ref main
+make sync-main
+# Review the upstream merge, then push it:
+git push origin main
+# Request a tested personal release from remote main plus open PRs:
+make release
 # Rebuild inputs that already have a successful release:
-gh workflow run personal-integration.yml --repo abhinavm24/typewhisper-mac --ref main -f force=true
+make release FORCE=true
 ```
+
+`make sync-main` fetches `origin/main` and `upstream/main`, fast-forwards local
+main from origin, then merges upstream with a merge commit when needed. It
+requires a clean main checkout and never pushes. If local main has diverged
+from origin, it stops for a manual merge or rebase. Upstream conflicts stay in
+your checkout: resolve them, `git add` the resolved files and `git commit`, or
+cancel with `git merge --abort`. If main is checked out in another worktree,
+run the command there.
+
+`make release` requires an authenticated GitHub CLI (`gh auth login`). It
+dispatches asynchronously on remote `main`; local unpushed changes are not
+included. CI observes upstream but does not sync or update fork main. You can
+also use the workflow's **Run workflow** button on GitHub. Follow the Actions
+link printed by Make, then run `make update` after publication succeeds.
 
 At most two runs are active, using alternating concurrency slots. Each new run
 replaces the older run in its slot. App tests, SDK tests and DMG packaging run in
 parallel within each run; release publishing remains serial. Inputs are checked again before publication;
-changed inputs prevent promotion. The new run uses the current open PR set. Title-only changes
-and other duplicate events skip work when those inputs already have a complete
+changed inputs prevent promotion. The new run uses the current open PR set.
+Repeated requests skip work when those inputs already have a complete
 published release. No external scheduler, PAT or Apple signing key is required.
 
 ## Releases and installation
@@ -64,8 +81,8 @@ records commits already included through another PR's ancestry. Closing a PR
 removes that direct input, but cannot remove code retained in another open PR.
 Keep features independent when individual removal matters.
 
-On a conflict, the run summary names the PR and files. Fix that source branch
-and push it. Nothing is automatically resolved with ours/theirs. On build/test
+On a PR conflict, the run summary names the PR and files. Fix that source branch
+and push it, then run `make release` again. Nothing is automatically resolved with ours/theirs. On build/test
 failure, inspect the `personal-*-logs` artifacts and repair the source PR.
 The previous successful integration and release remain available.
 
@@ -93,6 +110,8 @@ main. The existing upstream PR is independent of this integration workflow.
 
 ```sh
 python3 -m unittest discover -s .github/personal-integration -p 'test_*.py' -v
+make test-sync-main
+bash -n scripts/sync_main.sh
 bash -n .github/personal-integration/build.sh
 actionlint .github/workflows/personal-integration.yml
 ```

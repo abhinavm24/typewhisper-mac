@@ -23,7 +23,10 @@ can require fresh microphone/Accessibility grants. Run as your normal user; the
 helper requests sudo only when the app destination is not writable.
 
 Feature code belongs on its source PR branch. The GitHub integration workflow
-combines every open PR targeting this fork's main. Do not edit its generated
+combines every open PR targeting this fork's main when you run `make release`.
+It has no scheduled or push/PR triggers. To sync upstream, run `make sync-main`
+from clean main, resolve any conflicts locally, then `git push origin main`
+before requesting a release. Do not edit its generated
 `personal-integration` branch. See `docs/personal-integration.md` on fork main for
 CI controls, failure recovery and release details.
 
