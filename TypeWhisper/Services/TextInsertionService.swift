@@ -412,7 +412,7 @@ final class TextInsertionService {
         fileprivate let focusedTextState: FocusedTextState?
     }
 
-    fileprivate struct FocusedTextState: Equatable {
+    struct FocusedTextState: Equatable {
         let element: AXUIElement
         let value: String?
         let selectedText: String?
@@ -1386,7 +1386,7 @@ final class TextInsertionService {
         keyUp?.post(tap: .cgSessionEventTap)
     }
 
-    private func simulateCopy() {
+    func simulateCopy() {
         if let copySimulatorOverride {
             copySimulatorOverride()
             return
@@ -1780,7 +1780,7 @@ final class TextInsertionService {
         return captureFocusedTextState(for: element, messagingTimeout: messagingTimeout)
     }
 
-    private func captureFocusedTextState(
+    func captureFocusedTextState(
         for element: AXUIElement,
         messagingTimeout: Float? = nil
     ) -> FocusedTextState? {
