@@ -38,7 +38,6 @@ enum SettingsBackupExporter {
         UserDefaultsKeys.pttHotkeys,
         UserDefaultsKeys.toggleHotkeys,
         UserDefaultsKeys.promptPaletteHotkeys,
-        UserDefaultsKeys.voiceTransformHotkeys,
         UserDefaultsKeys.recentTranscriptionsHotkeys,
         UserDefaultsKeys.copyLastTranscriptionHotkeys,
         UserDefaultsKeys.pasteLastTranscriptionHotkeys,
@@ -70,11 +69,11 @@ enum SettingsBackupExporter {
     }
 
     struct SnippetDTO: Codable {
+        var scopeRawValue: String? = nil
         let trigger: String
         let replacement: String
         let caseSensitive: Bool
         let isEnabled: Bool
-        var scopeRawValue: String? = nil
     }
 
     struct PromptActionDTO: Codable {
@@ -488,13 +487,12 @@ enum SettingsBackupExporter {
             )
         }
 
-        let snippets = snippetService.snippets.map { snippet in
+        let snippets = snippetService.snippets.filter(\.isDictationSnippet).map { snippet in
             SnippetDTO(
                 trigger: snippet.trigger,
                 replacement: snippet.replacement,
                 caseSensitive: snippet.caseSensitive,
-                isEnabled: snippet.isEnabled,
-                scopeRawValue: snippet.scopeRawValue
+                isEnabled: snippet.isEnabled
             )
         }
 
@@ -702,8 +700,14 @@ enum SettingsBackupExporter {
         result.dictionarySkipped = backup.dictionaryEntries.count - dictionaryImported
 
         for snippet in backup.snippets {
-            // Future scopes must not silently become dictation expansions.
-            guard snippet.scopeRawValue == nil || snippet.scopeRawValue.flatMap(SnippetScope.init(rawValue:)) != nil else {
+            if let scope = snippet.scopeRawValue, scope != "dictation" {
+                if scope == "voiceTransform" || scope == "both" {
+                    if workflowService.addWorkflow(
+                        name: snippet.trigger, template: .custom, trigger: .manual(),
+                        behavior: WorkflowBehavior(settings: ["instruction": snippet.replacement], voiceEditingEnabled: true),
+                        isEnabled: snippet.isEnabled
+                    ) != nil { result.workflowsImported += 1 }
+                }
                 result.snippetsSkipped += 1
                 continue
             }
@@ -711,8 +715,7 @@ enum SettingsBackupExporter {
             snippetService.addSnippet(
                 trigger: snippet.trigger,
                 replacement: snippet.replacement,
-                caseSensitive: snippet.caseSensitive,
-                scope: snippet.scopeRawValue.flatMap(SnippetScope.init(rawValue:)) ?? .dictation
+                caseSensitive: snippet.caseSensitive
             )
             guard snippetService.snippets.count > beforeCount else {
                 result.snippetsSkipped += 1

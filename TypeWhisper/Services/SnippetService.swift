@@ -12,9 +12,29 @@ final class SnippetService: ObservableObject {
 
     @Published private(set) var snippets: [Snippet] = []
     private var hasDeferredUsageCountChanges = false
+    private weak var legacyWorkflowService: WorkflowService?
+
+    func connectLegacyVoiceEditingMigration(to workflowService: WorkflowService) {
+        legacyWorkflowService = workflowService
+        migrateLegacyVoiceEditingPrompts()
+    }
+
+    private func migrateLegacyVoiceEditingPrompts() {
+        guard let workflowService = legacyWorkflowService else { return }
+        for snippet in snippets where snippet.isLegacyVoiceEditingPrompt {
+            guard workflowService.workflow(id: snippet.id) == nil else { continue }
+            workflowService.addWorkflow(
+                name: snippet.trigger, template: .custom, trigger: .manual(),
+                behavior: WorkflowBehavior(settings: ["instruction": snippet.replacement], voiceEditingEnabled: true),
+                isEnabled: snippet.isEnabled, id: snippet.id
+            )
+        }
+        // Keep the original scoped records as hidden compatibility markers. A
+        // scope-less legacy sync return must never recreate a dictation expansion.
+    }
 
     var enabledSnippetsCount: Int {
-        snippets.filter { $0.isEnabled }.count
+        snippets.filter { $0.isEnabled && $0.isDictationSnippet }.count
     }
 
     init(appSupportDirectory: URL = AppConstants.appSupportDirectory) {
@@ -42,13 +62,14 @@ final class SnippetService: ObservableObject {
                 sortBy: [SortDescriptor(\.trigger, order: .forward)]
             )
             snippets = try context.fetch(descriptor)
+            migrateLegacyVoiceEditingPrompts()
         } catch {
             logger.error("Failed to fetch snippets: \(error.localizedDescription)")
         }
     }
 
     var appImportSnapshot: [AppVocabularyImport.Existing] {
-        snippets.map {
+        snippets.filter(\.isDictationSnippet).map {
             AppVocabularyImport.Existing(id: $0.id, entry: AppVocabularyImport.Entry(kind: .snippet, original: $0.trigger, replacement: $0.replacement),
                                          caseSensitive: $0.caseSensitive, isEnabled: $0.isEnabled)
         }
@@ -93,9 +114,8 @@ final class SnippetService: ObservableObject {
         }
     }
 
-    func addSnippet(trigger: String, replacement: String, caseSensitive: Bool = false, scope: SnippetScope = .dictation) {
+    func addSnippet(trigger: String, replacement: String, caseSensitive: Bool = false) {
         guard let context = modelContext else { return }
-        guard transformValidationError(trigger: trigger, replacement: replacement, scope: scope) == nil else { return }
 
         // Check for duplicate trigger
         if snippets.contains(where: { $0.trigger == trigger }) {
@@ -108,8 +128,7 @@ final class SnippetService: ObservableObject {
             replacement: replacement,
             caseSensitive: caseSensitive,
             createdAt: now,
-            updatedAt: now,
-            scope: scope
+            updatedAt: now
         )
 
         context.insert(snippet)
@@ -122,16 +141,12 @@ final class SnippetService: ObservableObject {
         }
     }
 
-    func updateSnippet(_ snippet: Snippet, trigger: String, replacement: String, caseSensitive: Bool, scope: SnippetScope? = nil) {
+    func updateSnippet(_ snippet: Snippet, trigger: String, replacement: String, caseSensitive: Bool) {
         guard let context = modelContext else { return }
-        if let effectiveScope = scope ?? snippet.scope {
-            guard transformValidationError(trigger: trigger, replacement: replacement, scope: effectiveScope, excluding: snippet.id) == nil else { return }
-        }
 
         snippet.trigger = trigger
         snippet.replacement = replacement
         snippet.caseSensitive = caseSensitive
-        if let scope { snippet.scopeRawValue = scope.rawValue }
         snippet.updatedAt = Date()
 
         do {
@@ -177,7 +192,7 @@ final class SnippetService: ObservableObject {
         var result = text
         var needsSave = false
 
-        for snippet in snippets where snippet.isEnabled && snippet.scope?.includesDictation == true {
+        for snippet in snippets where snippet.isEnabled && snippet.isDictationSnippet {
             guard !snippet.trigger.isEmpty else { continue }
 
             let ranges = snippetMatchRanges(for: snippet, in: result)
@@ -264,13 +279,12 @@ final class SnippetService: ObservableObject {
     }
 
     func userDataSyncSnippets() -> [UserDataSyncSnippet] {
-        snippets.map { snippet in
+        snippets.filter(\.isDictationSnippet).map { snippet in
             UserDataSyncSnippet(
                 trigger: snippet.trigger,
                 replacement: snippet.replacement,
                 caseSensitive: snippet.caseSensitive,
                 isEnabled: snippet.isEnabled,
-                scopeRawValue: snippet.scopeRawValue,
                 createdAt: snippet.createdAt,
                 updatedAt: snippet.effectiveUpdatedAt
             )
@@ -313,25 +327,25 @@ final class SnippetService: ObservableObject {
         if let snippet = snippets.first(where: {
             UserDataSyncIdentity.snippetItemID(trigger: $0.trigger) == targetID
         }) {
+            guard snippet.isDictationSnippet || synced.scopeRawValue != nil else { return }
+            if let scope = synced.scopeRawValue { snippet.scopeRawValue = scope }
             snippet.trigger = synced.trigger
             snippet.replacement = synced.replacement
             snippet.caseSensitive = synced.caseSensitive
             snippet.isEnabled = synced.isEnabled
-            snippet.scopeRawValue = synced.scopeRawValue
             snippet.updatedAt = synced.updatedAt
             return
         }
 
-        let inserted = Snippet(
+        context.insert(Snippet(
             trigger: synced.trigger,
             replacement: synced.replacement,
             caseSensitive: synced.caseSensitive,
             isEnabled: synced.isEnabled,
             createdAt: synced.createdAt,
-            updatedAt: synced.updatedAt
-        )
-        inserted.scopeRawValue = synced.scopeRawValue
-        context.insert(inserted)
+            updatedAt: synced.updatedAt,
+            scopeRawValue: synced.scopeRawValue
+        ))
     }
 
     private func deleteSyncedSnippet(itemID: String, context: ModelContext) {
@@ -340,6 +354,7 @@ final class SnippetService: ObservableObject {
         }) else {
             return
         }
+        guard snippet.isDictationSnippet else { return }
         context.delete(snippet)
     }
 }

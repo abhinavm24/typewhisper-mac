@@ -12,8 +12,11 @@ final class Snippet {
     var createdAt: Date
     var updatedAt: Date?
     var usageCount: Int
-    // Optional for lightweight migration of stores created before scopes existed.
+    // Retained only to recognize data written by the standalone Transform build.
     var scopeRawValue: String?
+
+    var isDictationSnippet: Bool { scopeRawValue == nil || scopeRawValue == "dictation" }
+    var isLegacyVoiceEditingPrompt: Bool { scopeRawValue == "voiceTransform" || scopeRawValue == "both" }
 
     init(
         id: UUID = UUID(),
@@ -24,7 +27,7 @@ final class Snippet {
         createdAt: Date = Date(),
         updatedAt: Date? = nil,
         usageCount: Int = 0,
-        scope: SnippetScope = .dictation
+        scopeRawValue: String? = nil
     ) {
         self.id = id
         self.trigger = trigger
@@ -34,7 +37,7 @@ final class Snippet {
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.usageCount = usageCount
-        self.scopeRawValue = scope.rawValue
+        self.scopeRawValue = scopeRawValue
     }
 
     var effectiveUpdatedAt: Date {

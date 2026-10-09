@@ -223,7 +223,6 @@ struct HotkeyRecorderView: View {
         case .pushToTalk: return String(localized: "Push-to-Talk")
         case .toggle: return String(localized: "Toggle")
         case .promptPalette: return String(localized: "Palette shortcut")
-        case .voiceTransform: return "Transform shortcut"
         case .recentTranscriptions: return String(localized: "Recent transcription shortcut")
         case .copyLastTranscription: return String(localized: "Copy last transcription shortcut")
         case .pasteLastTranscription: return String(localized: "Paste last transcription shortcut")

@@ -20,7 +20,6 @@ class SnippetsViewModel: ObservableObject {
     @Published var editTrigger = ""
     @Published var editReplacement = ""
     @Published var editCaseSensitive = false
-    @Published var editScope: SnippetScope = .dictation
 
     private let snippetService: SnippetService
     private var cancellables = Set<AnyCancellable>()
@@ -31,7 +30,7 @@ class SnippetsViewModel: ObservableObject {
 
     init(snippetService: SnippetService) {
         self.snippetService = snippetService
-        self.snippets = snippetService.snippets
+        self.snippets = snippetService.snippets.filter(\.isDictationSnippet)
         setupBindings()
     }
 
@@ -40,7 +39,7 @@ class SnippetsViewModel: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] snippets in
-                self?.snippets = snippets
+                self?.snippets = snippets.filter(\.isDictationSnippet)
             }
             .store(in: &cancellables)
     }
@@ -54,7 +53,6 @@ class SnippetsViewModel: ObservableObject {
         editTrigger = ""
         editReplacement = ""
         editCaseSensitive = false
-        editScope = .dictation
     }
 
     func startEditing(_ snippet: Snippet) {
@@ -64,7 +62,6 @@ class SnippetsViewModel: ObservableObject {
         editTrigger = snippet.trigger
         editReplacement = snippet.replacement
         editCaseSensitive = snippet.caseSensitive
-        editScope = snippet.scope ?? .dictation
     }
 
     func cancelEditing() {
@@ -82,27 +79,18 @@ class SnippetsViewModel: ObservableObject {
             return
         }
 
-        if let validationError = snippetService.transformValidationError(
-            trigger: editTrigger, replacement: editReplacement, scope: editScope, excluding: selectedSnippet?.id
-        ) {
-            error = validationError
-            return
-        }
-
         if isCreatingNew {
             snippetService.addSnippet(
                 trigger: editTrigger,
                 replacement: editReplacement,
-                caseSensitive: editCaseSensitive,
-                scope: editScope
+                caseSensitive: editCaseSensitive
             )
         } else if let snippet = selectedSnippet {
             snippetService.updateSnippet(
                 snippet,
                 trigger: editTrigger,
                 replacement: editReplacement,
-                caseSensitive: editCaseSensitive,
-                scope: editScope
+                caseSensitive: editCaseSensitive
             )
         }
 
