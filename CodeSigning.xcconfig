@@ -5,6 +5,10 @@
 //
 // Find your Team ID: Xcode > Settings > Accounts > select team
 
+// Personal fork updates are opt-in until an owned Sparkle public key is supplied.
+// $() keeps xcconfig from treating the URL's double slash as a comment.
+TYPEWHISPER_PERSONAL_UPDATE_FEED_URL = https:/$()/abhinavm24.github.io/typewhisper-mac/appcast.xml
+TYPEWHISPER_PERSONAL_UPDATE_PUBLIC_KEY =
 #include? "CodeSigning.local.xcconfig"
 APP_GROUP_ID = $(DEVELOPMENT_TEAM).com.typewhisper.mac
 TYPEWHISPER_RELEASE_CHANNEL = stable
