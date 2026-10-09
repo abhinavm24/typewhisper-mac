@@ -1206,6 +1206,10 @@ private struct WorkflowEditorPage: View {
                     translationProcessorSection
                 }
 
+                if draft.template != .dictation && !draft.usesAppleTranslate {
+                    workflowVoiceEditingSection
+                }
+
                 if draft.template == .custom {
                     WorkflowTextEditorField(
                         title: localizedAppText("Instruction", de: "Anweisung"),
@@ -1329,7 +1333,7 @@ private struct WorkflowEditorPage: View {
     }
 
     private var shouldShowActionTargetSection: Bool {
-        draft.template != .dictation
+        draft.template != .dictation && draft.voiceEditingEnabled != true
             && (!sortedActionPlugins.isEmpty || draft.targetActionPluginId != nil)
     }
 
@@ -1465,6 +1469,31 @@ private struct WorkflowEditorPage: View {
                     }
                 }
             }
+        }
+    }
+
+    private var workflowVoiceEditingSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Toggle(localizedAppText("Voice edit selected text", de: "Markierten Text per Sprache bearbeiten"), isOn: Binding(
+                get: { draft.voiceEditingEnabled == true },
+                set: { enabled in
+                    draft.voiceEditingEnabled = enabled ? true : nil
+                    if enabled {
+                        draft.hotkeyBehavior = .processSelectedText
+                        draft.isAppTriggerEnabled = false
+                        draft.isWebsiteTriggerEnabled = false
+                        if draft.triggerMode == .global { draft.triggerMode = .manual }
+                        if draft.triggerMode == .automatic && !draft.isHotkeyTriggerEnabled { draft.triggerMode = .manual }
+                        draft.targetActionPluginId = nil
+                        draft.autoEnterMode = .never
+                    }
+                }
+            ))
+            Text(localizedAppText(
+                "Run from the Workflow Palette or a Process Selected Text shortcut. Speak an additional instruction, then review and choose Replace or Copy. A saved prompt is optional for custom workflows.",
+                de: "Über die Workflow-Palette oder einen Shortcut für markierten Text starten. Eine zusätzliche Anweisung sprechen, dann prüfen und Ersetzen oder Kopieren wählen. Bei eigenen Workflows ist ein gespeicherter Prompt optional."
+            ))
+            .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1800,7 +1829,9 @@ private struct WorkflowEditorPage: View {
                     if draft.template != .dictation {
                         Text(localizedAppText("Manual", de: "Manuell")).tag(WorkflowTriggerMode.manual)
                     }
-                    Text(localizedAppText("Always", de: "Immer")).tag(WorkflowTriggerMode.global)
+                    if draft.voiceEditingEnabled != true {
+                        Text(localizedAppText("Always", de: "Immer")).tag(WorkflowTriggerMode.global)
+                    }
                 }
                 .pickerStyle(.segmented)
 
@@ -1863,27 +1894,28 @@ private struct WorkflowEditorPage: View {
 
     private var automaticTriggerEditor: some View {
         VStack(alignment: .leading, spacing: 0) {
-            triggerComponentEditor(
-                title: localizedAppText("App", de: "App"),
-                isOn: $draft.isAppTriggerEnabled
-            ) {
-                appTriggerEditor
+            if draft.voiceEditingEnabled != true {
+                triggerComponentEditor(
+                    title: localizedAppText("App", de: "App"),
+                    isOn: $draft.isAppTriggerEnabled
+                ) {
+                    appTriggerEditor
+                }
+
+                Divider()
+
+                #if !APPSTORE
+                // The sandboxed edition cannot match website triggers.
+                triggerComponentEditor(
+                    title: localizedAppText("Website", de: "Website"),
+                    isOn: $draft.isWebsiteTriggerEnabled
+                ) {
+                    websiteTriggerEditor
+                }
+
+                Divider()
+                #endif
             }
-
-            // The sandboxed App Store edition cannot read browser URLs, so a
-            // website trigger would never match.
-            #if !APPSTORE
-            Divider()
-
-            triggerComponentEditor(
-                title: localizedAppText("Website", de: "Website"),
-                isOn: $draft.isWebsiteTriggerEnabled
-            ) {
-                websiteTriggerEditor
-            }
-            #endif
-
-            Divider()
 
             triggerComponentEditor(
                 title: localizedAppText("Hotkey", de: "Hotkey"),
@@ -2024,14 +2056,14 @@ private struct WorkflowEditorPage: View {
                     localizedAppText("Shortcut Behavior", de: "Shortcut-Verhalten"),
                     selection: $draft.hotkeyBehavior
                 ) {
-                    ForEach(WorkflowHotkeyBehavior.allCases, id: \.self) { behavior in
+                    ForEach(WorkflowHotkeyBehavior.allCases.filter { draft.voiceEditingEnabled != true || $0 == .processSelectedText }, id: \.self) { behavior in
                         Text(behavior.editorLabel).tag(behavior)
                     }
                 }
                 .pickerStyle(.segmented)
                 .labelsHidden()
 
-                Text(draft.hotkeyBehavior.editorDescription)
+                Text(draft.voiceEditingEnabled == true ? localizedAppText("Starts a spoken instruction for the selected text, then opens workflow review.", de: "Startet eine gesprochene Anweisung für den markierten Text und öffnet das Workflow-Review.") : draft.hotkeyBehavior.editorDescription)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -2790,6 +2822,7 @@ struct WorkflowDraft {
     var microphoneBoostOverride: Bool?
     var inlineCommandsEnabled: Bool?
     var segmentedPostProcessingEnabled: Bool?
+    var voiceEditingEnabled: Bool?
 
     private var preservedBehaviorSettings: [String: String]
     var providerId: String?
@@ -2826,6 +2859,7 @@ struct WorkflowDraft {
         self.microphoneBoostOverride = nil
         self.inlineCommandsEnabled = nil
         self.segmentedPostProcessingEnabled = nil
+        self.voiceEditingEnabled = nil
         self.preservedBehaviorSettings = [:]
         self.providerId = nil
         self.cloudModel = nil
@@ -2861,6 +2895,7 @@ struct WorkflowDraft {
         self.microphoneBoostOverride = behavior.microphoneBoostOverride
         self.inlineCommandsEnabled = workflow.template == .dictation ? behavior.inlineCommandsEnabled : nil
         self.segmentedPostProcessingEnabled = behavior.segmentedPostProcessingEnabled
+        self.voiceEditingEnabled = behavior.voiceEditingEnabled
         self.hotkeyBehavior = .startDictation
         self.preservedBehaviorSettings = behavior.settings
         self.providerId = behavior.providerId
@@ -2938,6 +2973,12 @@ struct WorkflowDraft {
         )
         let outputRouteSentence = workflowOutputRouteSentence(targetActionPluginId: targetActionPluginId)
 
+        if voiceEditingEnabled == true {
+            return localizedAppText(
+                "\(resolvedName) uses selected text as input, adds a spoken instruction, and shows a review with Replace and Copy.\(languageSentence)",
+                de: "\(resolvedName) verwendet markierten Text, ergänzt eine gesprochene Anweisung und zeigt ein Review mit Ersetzen und Kopieren.\(languageSentence)"
+            )
+        }
         if triggerMode == .manual {
             return localizedAppText(
                 "\(resolvedName) is available as \(template.definition.name) from the Workflow Palette.\(languageSentence)\(outputRouteSentence)",
@@ -2976,6 +3017,7 @@ struct WorkflowDraft {
             translationTargetLanguage = ""
         } else {
             translationProcessor = Self.defaultTranslationProcessor
+            if usesAppleTranslate { voiceEditingEnabled = nil }
             if translationTargetLanguage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 translationTargetLanguage = Self.defaultTranslationTargetLanguage(for: translationProcessor)
             }
@@ -2986,6 +3028,7 @@ struct WorkflowDraft {
         }
 
         if newTemplate == .dictation {
+            voiceEditingEnabled = nil
             fineTuning = ""
             outputFormat = ""
             providerId = nil
@@ -3012,6 +3055,18 @@ struct WorkflowDraft {
         pluginManager: PluginManager,
         existingWorkflowId: UUID?
     ) -> String? {
+        if voiceEditingEnabled == true {
+            if !usesLLMProcessing || template == .dictation {
+                return localizedAppText("Voice editing requires an LLM workflow.", de: "Sprachbearbeitung benötigt einen LLM-Workflow.")
+            }
+            if triggerMode == .global || (triggerMode == .automatic &&
+                (isAppTriggerEnabled || isWebsiteTriggerEnabled || !isHotkeyTriggerEnabled || hotkeyBehavior != .processSelectedText)) {
+                return localizedAppText("Voice editing runs from the Workflow Palette or a Process Selected Text shortcut.", de: "Sprachbearbeitung wird über die Workflow-Palette oder einen Shortcut für markierten Text gestartet.")
+            }
+            if targetActionPluginId != nil || autoEnterMode != .never {
+                return localizedAppText("Voice editing uses explicit Replace and Copy actions without submitting text.", de: "Sprachbearbeitung verwendet Ersetzen und Kopieren ohne den Text abzusenden.")
+            }
+        }
         if template == .dictation && triggerMode == .manual {
             return localizedAppText(
                 "Dictation Only workflows need a recording trigger.",
@@ -3126,7 +3181,7 @@ struct WorkflowDraft {
             #endif
         }
 
-        if template == .custom {
+        if template == .custom && voiceEditingEnabled != true {
             let hasCustomInstruction = !customInstruction.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             let hasFineTuning = !fineTuning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             if !hasCustomInstruction && !hasFineTuning {
@@ -3217,7 +3272,8 @@ struct WorkflowDraft {
             temperatureValue: temperatureValue,
             segmentedPostProcessingEnabled: supportsSegmentedPostProcessing && segmentedPostProcessingEnabled == true
                 ? true
-                : nil
+                : nil,
+            voiceEditingEnabled: usesLLMProcessing && template != .dictation && voiceEditingEnabled == true ? true : nil
         )
     }
 
@@ -3319,6 +3375,7 @@ struct WorkflowDraft {
 
         switch processor {
         case .appleTranslate:
+            voiceEditingEnabled = nil
             if let normalized = WorkflowTranslationLanguageNormalizer.normalizedLanguageIdentifier(from: current) {
                 translationTargetLanguage = normalized
             } else {
