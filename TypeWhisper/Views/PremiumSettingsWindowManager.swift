@@ -382,7 +382,7 @@ struct PremiumCloudSyncSettingsWindow: View {
         #if APPSTORE
         syncController.canUseSync
         #else
-        premiumAccount.isSignedIn && premiumAccount.hasPremiumEntitlement && syncController.canUseSync
+        LocalFeatureAccess.customFolderSync || syncController.canUseSync
         #endif
     }
 

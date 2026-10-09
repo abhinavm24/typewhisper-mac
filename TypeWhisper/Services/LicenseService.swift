@@ -223,8 +223,13 @@ final class LicenseService: ObservableObject {
             activationId: stored.activationId
         )
     }
-    var canUseProTranscriptionFallback: Bool { hasCommercialLicense || isSupporter }
+    var canUseProTranscriptionFallback: Bool {
+        LocalFeatureAccess.automaticTranscriptionFallback || hasCommercialLicense || isSupporter
+    }
     #endif
+    var canUseCorrectionLearning: Bool {
+        LocalFeatureAccess.correctionLearning || hasCommercialLicense
+    }
     /// Throws when the supporter Keychain entry cannot be read right now, so callers keep claim state.
     func readSupporterClaimProof() throws -> SupporterClaimProof? {
         guard supporterStatus == .active,

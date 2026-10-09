@@ -54,7 +54,9 @@ struct PremiumSettingsView: View {
                     AppStorePremiumStoreView()
                     #endif
 
-                    if access.hasAnyPremiumAccess {
+                    if LocalFeatureAccess.correctionLearning
+                        || LocalFeatureAccess.customFolderSync
+                        || access.hasAnyPremiumAccess {
                         PremiumActiveFeatureOverview(
                             licenseService: license,
                             premiumAccount: premiumAccount,
@@ -302,7 +304,7 @@ struct PremiumCorrectionLearningSettingsView: View {
     }
 
     var body: some View {
-        if license.hasCommercialLicense {
+        if license.canUseCorrectionLearning {
             enabledContent
         } else {
             PremiumLockedDetailView(
@@ -447,9 +449,9 @@ struct PremiumCorrectionLearningSettingsView: View {
 
     private var learningBinding: Binding<Bool> {
         Binding(
-            get: { license.hasCommercialLicense && learningEnabled },
+            get: { license.canUseCorrectionLearning && learningEnabled },
             set: { newValue in
-                guard license.hasCommercialLicense else { return }
+                guard license.canUseCorrectionLearning else { return }
                 learningEnabled = newValue
             }
         )
