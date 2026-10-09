@@ -108,7 +108,8 @@ final class WorkflowService: ObservableObject {
         behavior: WorkflowBehavior = WorkflowBehavior(),
         output: WorkflowOutput = WorkflowOutput(),
         isEnabled: Bool = true,
-        sortOrder: Int? = nil
+        sortOrder: Int? = nil,
+        id: UUID? = nil
     ) -> Workflow? {
         let workflow = Workflow(
             name: name,
@@ -120,6 +121,7 @@ final class WorkflowService: ObservableObject {
             output: output
         )
 
+        if let id { workflow.id = id }
         modelContext.insert(workflow)
         save()
         fetchWorkflows()
@@ -206,7 +208,7 @@ final class WorkflowService: ObservableObject {
     func matchWorkflow(bundleIdentifier: String?, url: String? = nil) -> WorkflowMatchResult? {
         let bundleId = bundleIdentifier ?? ""
         let domain = extractDomain(from: url)
-        let enabled = workflows.filter(\.isEnabled)
+        let enabled = workflows.filter { $0.isEnabled && !$0.usesVoiceEditing }
 
         if !bundleId.isEmpty, let domain {
             let matches = enabled.filter { workflow in

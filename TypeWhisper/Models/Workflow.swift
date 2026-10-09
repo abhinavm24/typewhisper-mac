@@ -312,6 +312,8 @@ struct WorkflowBehavior: Codable, Equatable, Sendable {
     /// for streaming engines, concurrently after stop otherwise). `nil` means off,
     /// so data written by builds without this field decodes unchanged.
     var segmentedPostProcessingEnabled: Bool?
+    /// Selected-text executions record an instruction and require explicit review.
+    var voiceEditingEnabled: Bool?
 
     init(
         settings: [String: String] = [:],
@@ -325,7 +327,8 @@ struct WorkflowBehavior: Codable, Equatable, Sendable {
         inlineCommandsEnabled: Bool? = nil,
         temperatureModeRaw: String? = nil,
         temperatureValue: Double? = nil,
-        segmentedPostProcessingEnabled: Bool? = nil
+        segmentedPostProcessingEnabled: Bool? = nil,
+        voiceEditingEnabled: Bool? = nil
     ) {
         self.settings = settings
         self.fineTuning = fineTuning
@@ -339,6 +342,7 @@ struct WorkflowBehavior: Codable, Equatable, Sendable {
         self.temperatureModeRaw = temperatureModeRaw
         self.temperatureValue = temperatureValue
         self.segmentedPostProcessingEnabled = segmentedPostProcessingEnabled
+        self.voiceEditingEnabled = voiceEditingEnabled
     }
 
     var temperatureMode: PluginLLMTemperatureMode {
@@ -779,8 +783,12 @@ extension Workflow {
         behavior.segmentedPostProcessingEnabled == true && supportsSegmentedPostProcessing
     }
 
+    var usesVoiceEditing: Bool {
+        behavior.voiceEditingEnabled == true && template != .dictation && !usesAppleTranslate
+    }
+
     var isManuallyRunnable: Bool {
-        usesInlineCommands || usesAppleTranslate || systemPrompt() != nil || output.targetActionPluginId != nil
+        usesVoiceEditing || usesInlineCommands || usesAppleTranslate || systemPrompt() != nil || output.targetActionPluginId != nil
     }
 
     func systemPrompt(
