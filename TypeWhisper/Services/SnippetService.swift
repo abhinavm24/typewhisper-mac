@@ -292,6 +292,8 @@ final class SnippetService: ObservableObject {
                  .upsertHistoryContent,
                  .upsertHistoryInbox,
                  .upsertHistoryAudio,
+                 .upsertHistoryTranscript,
+                 .upsertHistorySpeakers,
                  .deleteHistory:
                 continue
             }

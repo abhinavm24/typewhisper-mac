@@ -107,22 +107,70 @@ enum OutputFormatter {
         }
 
         var lines = [
-            "Workflows: \(integer("workflowsImported")) imported",
+            "Workflows: \(integer("workflowsImported")) imported, \(integer("workflowsUpdated")) updated, \(integer("workflowsSkipped")) skipped",
             "Dictionary: \(integer("dictionaryImported")) imported, \(integer("dictionarySkipped")) skipped",
             "Snippets: \(integer("snippetsImported")) imported, \(integer("snippetsSkipped")) skipped",
-            "Prompt Actions: \(integer("promptActionsImported")) imported",
-            "Profiles: \(integer("profilesImported")) imported",
+            "Prompt Actions: \(integer("promptActionsImported")) imported, \(integer("promptActionsUpdated")) updated, \(integer("promptActionsSkipped")) skipped",
+            "Profiles: \(integer("profilesImported")) imported, \(integer("profilesUpdated")) updated, \(integer("profilesSkipped")) skipped",
             "Hotkeys: \(integer("hotkeysApplied")) applied, \(integer("hotkeysSkipped")) skipped",
             "Plugins: \(integer("pluginsInstalled")) installed, \(integer("pluginsSkipped")) skipped",
-            "History: \(integer("historyImported")) imported, \(integer("historySkippedByRetention")) skipped by retention",
+            "History: \(integer("historyImported")) imported, \(integer("historySkippedAsDuplicate")) skipped as duplicates, \(integer("historySkippedByRetention")) skipped by retention",
             "Preferences: \(integer("preferencesApplied")) applied",
         ]
+        if integer("historySkippedUnreadableDestination") > 0 {
+            lines.append("Warning: \(integer("historySkippedUnreadableDestination")) history entries were skipped because the existing history could not be read.")
+        }
         if result["updateChannelApplied"] as? Bool == true {
             lines.append("Update channel applied")
         }
         if result["pluginsRegistryFetchFailed"] as? Bool == true {
             lines.append("Warning: The plugin marketplace could not be reached; some plugins may have been skipped.")
         }
+        return lines.joined(separator: "\n")
+    }
+
+    static func formatAudioSettings(_ data: Data, json: Bool) -> String {
+        if json {
+            return prettyJSON(data)
+        }
+        guard let settings = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return prettyJSON(data)
+        }
+
+        func device(_ value: Any?) -> String? {
+            guard let device = value as? [String: Any], let id = device["id"] as? String else { return nil }
+            return "\(device["name"] as? String ?? id) [\(id)]"
+        }
+        func onOff(_ key: String) -> String {
+            settings[key] as? Bool == true ? "on" : "off"
+        }
+
+        let devices = settings["input_devices"] as? [[String: Any]] ?? []
+        let availableIDs = Set(devices.compactMap { $0["id"] as? String })
+        let priority = settings["input_priority"] as? [[String: Any]] ?? []
+
+        var lines = ["Active input: \(device(settings["active_input"]) ?? "none")"]
+        if priority.isEmpty {
+            lines.append("Input priority: system default")
+        } else {
+            lines.append("Input priority:")
+            for (index, item) in priority.enumerated() {
+                let connected = (item["id"] as? String).map(availableIDs.contains) ?? false
+                lines.append("  \(index + 1). \(device(item) ?? "?")\(connected ? "" : " (not connected)")")
+            }
+        }
+        lines.append("Available inputs:")
+        for item in devices {
+            let isDefault = item["is_system_default"] as? Bool == true
+            lines.append("  \(device(item) ?? "?")\(isDefault ? " (system default)" : "")")
+        }
+        var ducking = onOff("audio_ducking_enabled")
+        if settings["audio_ducking_enabled"] as? Bool == true, let level = settings["audio_ducking_level"] as? Double {
+            ducking += " (\(Int((level * 100).rounded()))% volume)"
+        }
+        lines.append("Audio ducking: \(ducking)")
+        lines.append("Pause media during recording: \(onOff("pause_media_during_recording"))")
+        lines.append("Sound feedback: \(onOff("sound_feedback_enabled"))")
         return lines.joined(separator: "\n")
     }
 

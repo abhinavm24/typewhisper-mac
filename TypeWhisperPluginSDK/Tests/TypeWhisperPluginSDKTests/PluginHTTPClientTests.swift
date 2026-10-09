@@ -56,6 +56,117 @@ final class PluginHTTPClientTests: XCTestCase {
         XCTAssertEqual(store.sessions[1].requestedPaths, ["/retry"])
     }
 
+    func testCancelledRequestMovesTheNextRequestToAFreshSession() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            store.makeSession(
+                outcomes: [.success(Self.okResponse())],
+                hangsUntilCancelled: store.sessions.isEmpty
+            )
+        }
+
+        // Built outside the task: capturing the test class's metatype in the
+        // closure trips the region-based isolation checker on Xcode 26.
+        let previewRequest = Self.request(path: "/preview")
+        let preview = Task { _ = try await PluginHTTPClient.data(for: previewRequest) }
+        let deadline = ContinuousClock.now + .seconds(5)
+        while !store.firstSessionHasRequests, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        guard store.firstSessionHasRequests else {
+            preview.cancel()
+            return XCTFail("the preview request never started")
+        }
+
+        preview.cancel()
+        let (data, _) = try await PluginHTTPClient.data(for: Self.request(path: "/final"))
+
+        XCTAssertEqual(String(data: data, encoding: .utf8), "ok")
+        XCTAssertEqual(store.sessions.count, 2)
+        guard store.sessionCount == 2 else { return }
+        XCTAssertTrue(store.sessions[0].didInvalidate)
+        XCTAssertEqual(store.sessions[0].requestedPaths, ["/preview"])
+        XCTAssertEqual(store.sessions[1].requestedPaths, ["/final"])
+        let previewResult = await preview.result
+        XCTAssertThrowsError(try previewResult.get())
+    }
+
+    func testCompletedRequestsKeepTheSharedSession() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            store.makeSession(outcomes: [.success(Self.okResponse())])
+        }
+
+        let firstRequest = Self.request(path: "/first")
+        let first = Task { _ = try await PluginHTTPClient.data(for: firstRequest) }
+        try await first.value
+        first.cancel()
+        _ = try await PluginHTTPClient.data(for: Self.request(path: "/second"))
+
+        XCTAssertEqual(store.sessions.count, 1)
+        XCTAssertFalse(store.sessions[0].didInvalidate)
+    }
+
+    func testRequestStartedOnAnInvalidatedSessionRetriesOnAFreshOne() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            if store.sessionCount == 0 {
+                // Another request's cancellation resets the shared session between
+                // this request borrowing it and its task starting.
+                return store.makeSession(
+                    outcomes: [.failure(URLError(.cancelled))],
+                    beforeResponding: { PluginHTTPClient.resetSharedSession(reason: "other request cancelled") }
+                )
+            }
+            return store.makeSession(outcomes: [.success(Self.okResponse())])
+        }
+
+        let (data, _) = try await PluginHTTPClient.data(
+            for: Self.request(path: "/borrowed"),
+            retry: .disabled
+        )
+
+        XCTAssertEqual(String(data: data, encoding: .utf8), "ok")
+        XCTAssertEqual(store.sessionCount, 2)
+    }
+
+    func testRestartAfterAnInvalidatedSessionKeepsTheFirstTransportRetry() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            switch store.sessionCount {
+            case 0:
+                return store.makeSession(
+                    outcomes: [.failure(URLError(.cancelled))],
+                    beforeResponding: { PluginHTTPClient.resetSharedSession(reason: "other request cancelled") }
+                )
+            case 1:
+                return store.makeSession(outcomes: [.failure(URLError(.networkConnectionLost))])
+            default:
+                return store.makeSession(outcomes: [.success(Self.okResponse())])
+            }
+        }
+
+        let (data, _) = try await PluginHTTPClient.data(for: Self.request(path: "/post"), retry: .disabled)
+
+        XCTAssertEqual(String(data: data, encoding: .utf8), "ok")
+        XCTAssertEqual(store.sessionCount, 3)
+    }
+
+    func testCancelledPostOnTheSharedSessionIsNotSentAgain() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            store.makeSession(outcomes: [.failure(URLError(.cancelled))])
+        }
+
+        do {
+            _ = try await PluginHTTPClient.data(for: Self.request(path: "/post"), retry: .disabled)
+            XCTFail("expected the cancellation to be thrown")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .cancelled)
+        }
+        XCTAssertEqual(store.sessionCount, 1)
+    }
+
     func testHTTPClientResourceTimeoutAllowsLongRunningRequests() async throws {
         let store = MockHTTPSessionStore()
         PluginHTTPClient.configureForTesting { configuration in
@@ -350,6 +461,133 @@ final class PluginHTTPClientTests: XCTestCase {
                        "a GET is safe to repeat, so it uses the whole ladder")
     }
 
+    func testLongUploadsGetMoreTimeThanTheSharedSession() {
+        // Up to 600 s the upload stays on the shared session.
+        XCTAssertEqual(PluginHTTPClient.resourceTimeout(forUploadOf: 200_000), 600)
+        XCTAssertEqual(PluginHTTPClient.resourceTimeout(forUploadOf: 9_600_000), 600)
+        // The transfer at 256 kbit/s plus five minutes to connect and answer.
+        // Two hours are about 43 MB as 48 kbit/s AAC and 230 MB as WAV.
+        XCTAssertEqual(PluginHTTPClient.resourceTimeout(forUploadOf: 43_200_000), 1_650)
+        XCTAssertEqual(PluginHTTPClient.resourceTimeout(forUploadOf: 230_400_000), 7_500)
+    }
+
+    func testDedicatedSessionRetriesAFailedConnection() async throws {
+        // Nothing reached the provider, so a long upload tries again on a fresh
+        // session with the same long timeout.
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { configuration in
+            if store.sessionCount == 0 {
+                return store.makeSession(outcomes: [.failure(URLError(.cannotConnectToHost))], configuration: configuration)
+            }
+            return store.makeSession(outcomes: [.success(Self.okResponse())], configuration: configuration)
+        }
+
+        let (_, response) = try await PluginHTTPClient.data(
+            for: Self.request(path: "/large-upload"),
+            resourceTimeout: 1_650
+        )
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(store.sessions.count, 2)
+        XCTAssertTrue(store.sessions.allSatisfy(\.didInvalidate))
+        XCTAssertEqual(store.configurations.map(\.timeoutIntervalForResource), [1_650, 1_650])
+    }
+
+    func testDedicatedSessionDoesNotRepeatAPostThatLostItsConnection() async throws {
+        // The provider may already have created the job; a second POST could
+        // create and bill another one.
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { configuration in
+            store.makeSession(outcomes: [.failure(URLError(.networkConnectionLost))], configuration: configuration)
+        }
+        var request = Self.request(path: "/jobs")
+        request.httpBody = Data(count: 30_000_000)
+
+        do {
+            _ = try await PluginHTTPClient.data(for: request, resourceTimeout: 1_650)
+            XCTFail("expected the lost connection")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .networkConnectionLost)
+            XCTAssertTrue(error.localizedDescription.contains("30.0 MB"))
+        }
+        XCTAssertEqual(store.sessions.count, 1)
+    }
+
+    func testDedicatedSessionDoesNotRepeatARequestThatTimedOut() async throws {
+        // After a timeout of up to hours the provider may still be transcribing;
+        // sending the POST again would duplicate the work and double the wait.
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { configuration in
+            store.makeSession(outcomes: [.failure(URLError(.timedOut))], configuration: configuration)
+        }
+
+        do {
+            _ = try await PluginHTTPClient.data(for: Self.request(path: "/long-transcription"), resourceTimeout: 1_650)
+            XCTFail("expected the timeout")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .timedOut)
+        }
+        XCTAssertEqual(store.sessions.count, 1)
+    }
+
+    func testDedicatedSessionRetriesAStatusTheOriginNeverSaw() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { configuration in
+            if store.sessionCount == 0 {
+                return store.makeSession(outcomes: [.success(Self.statusResponse(522))], configuration: configuration)
+            }
+            return store.makeSession(outcomes: [.success(Self.okResponse())], configuration: configuration)
+        }
+        PluginHTTPClient.configureRetryForTesting(sleeper: { _ in })
+
+        let (_, response) = try await PluginHTTPClient.data(
+            for: Self.request(path: "/large-upload"),
+            resourceTimeout: 1_650
+        )
+
+        XCTAssertEqual((response as? HTTPURLResponse)?.statusCode, 200)
+        XCTAssertEqual(store.sessions.count, 2)
+    }
+
+    func testLostConnectionDuringALargeUploadNamesTheUploadSize() async throws {
+        // A proxy enforcing an upload cap closes the connection mid-body, so
+        // the 413 never arrives and URLSession reports -1005 (#1538).
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            store.makeSession(outcomes: [.failure(URLError(.networkConnectionLost))])
+        }
+        var request = Self.request(path: "/large-upload")
+        request.httpBody = Data(count: 30_000_000)
+
+        do {
+            _ = try await PluginHTTPClient.data(for: request)
+            XCTFail("expected the lost connection")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .networkConnectionLost)
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The connection was lost while uploading 30.0 MB. The provider may not accept uploads of this size."
+            )
+        }
+        XCTAssertEqual(store.sessions.flatMap(\.requestedPaths).count, 2,
+                       "the compatibility retry still runs")
+    }
+
+    func testLostConnectionDuringASmallUploadKeepsTheSystemMessage() async throws {
+        let store = MockHTTPSessionStore()
+        PluginHTTPClient.configureForTesting { _ in
+            store.makeSession(outcomes: [.failure(URLError(.networkConnectionLost))])
+        }
+
+        do {
+            _ = try await PluginHTTPClient.data(for: Self.request(path: "/small-upload"))
+            XCTFail("expected the lost connection")
+        } catch {
+            XCTAssertEqual((error as? URLError)?.code, .networkConnectionLost)
+            XCTAssertEqual(error.localizedDescription, URLError(.networkConnectionLost).localizedDescription)
+        }
+    }
+
     func testDoesNotRetry503OnANonIdempotentRequest() async throws {
         // Conceded after two independent reviewers pointed at the same exposure:
         // AssemblyAIPlugin.submitTranscription POSTs job creation through the default
@@ -586,11 +824,25 @@ private final class MockHTTPSessionStore: @unchecked Sendable {
     private(set) var sessions: [MockHTTPSession] = []
     private(set) var configurations: [URLSessionConfiguration] = []
 
+    var sessionCount: Int {
+        lock.withLock { sessions.count }
+    }
+
+    var firstSessionHasRequests: Bool {
+        lock.withLock { sessions.first }?.hasRequests ?? false
+    }
+
     func makeSession(
         outcomes: [Result<(Data, URLResponse), Error>],
-        configuration: URLSessionConfiguration? = nil
+        configuration: URLSessionConfiguration? = nil,
+        hangsUntilCancelled: Bool = false,
+        beforeResponding: (@Sendable () -> Void)? = nil
     ) -> MockHTTPSession {
-        let session = MockHTTPSession(outcomes: outcomes)
+        let session = MockHTTPSession(
+            outcomes: outcomes,
+            hangsUntilCancelled: hangsUntilCancelled,
+            beforeResponding: beforeResponding
+        )
         lock.withLock {
             sessions.append(session)
             if let configuration {
@@ -607,9 +859,17 @@ private final class MockHTTPSession: PluginHTTPClientSession, @unchecked Sendabl
     private(set) var requestedPaths: [String] = []
     private(set) var requestedRequests: [URLRequest] = []
     private(set) var didInvalidate = false
+    private let hangsUntilCancelled: Bool
+    private let beforeResponding: (@Sendable () -> Void)?
 
-    init(outcomes: [Result<(Data, URLResponse), Error>]) {
+    init(
+        outcomes: [Result<(Data, URLResponse), Error>],
+        hangsUntilCancelled: Bool = false,
+        beforeResponding: (@Sendable () -> Void)? = nil
+    ) {
         self.outcomes = outcomes
+        self.hangsUntilCancelled = hangsUntilCancelled
+        self.beforeResponding = beforeResponding
     }
 
     func data(for request: URLRequest) async throws -> (Data, URLResponse) {
@@ -622,7 +882,15 @@ private final class MockHTTPSession: PluginHTTPClientSession, @unchecked Sendabl
             return outcomes.first ?? .failure(URLError(.badServerResponse))
         }
 
+        if hangsUntilCancelled {
+            try await Task.sleep(for: .seconds(60))
+        }
+        beforeResponding?()
         return try outcome.get()
+    }
+
+    var hasRequests: Bool {
+        lock.withLock { !requestedPaths.isEmpty }
     }
 
     func finishTasksAndInvalidate() {

@@ -211,13 +211,40 @@ public enum PluginHTTPClient {
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = resourceTimeout
         config.timeoutIntervalForResource = resourceTimeout
-        let session = sessionFactory(config)
-        defer { session.finishTasksAndInvalidate() }
+        return try await dataWithRetries(for: request, policy: .default, dedicatedConfiguration: config)
+    }
 
-        let method = request.httpMethod ?? "GET"
-        let url = request.url?.absoluteString ?? "unknown"
-        logger.info("\(method) \(url) (dedicated session, resourceTimeout=\(resourceTimeout))")
-        return try await session.data(for: request)
+    /// A resource timeout for `data(for:resourceTimeout:)` that gives an
+    /// upload of `byteCount` bytes the time 256 kbit/s needs, plus five
+    /// minutes to connect and answer. Bodies up to 9.6 MB keep the shared
+    /// session's 600 s; a recording of several hours takes far longer on a
+    /// slow uplink.
+    public static func resourceTimeout(forUploadOf byteCount: Int) -> TimeInterval {
+        max(longRunningResourceTimeout, Double(byteCount) / 32_000 + 300)
+    }
+
+    /// Upload caps of cloud transcription APIs start at 25 MB (OpenAI, Groq).
+    /// A connection lost on a smaller body is more likely a network problem.
+    static let largeUploadByteCount = 20_000_000
+
+    /// Upload caps are often enforced by a proxy that closes the connection
+    /// once it has read part of an oversized body, before the client sees the
+    /// 413. URLSession then reports a lost connection, which reads like a
+    /// network problem and hides the size limit (#1538).
+    static func describingRejectedLargeUpload(_ error: any Error, request: URLRequest) -> any Error {
+        guard let urlError = error as? URLError,
+              urlError.code == .networkConnectionLost,
+              let byteCount = request.httpBody?.count,
+              byteCount >= largeUploadByteCount
+        else {
+            return error
+        }
+
+        let megabytes = String(format: "%.1f", Double(byteCount) / 1_000_000)
+        var userInfo = urlError.userInfo
+        userInfo[NSLocalizedDescriptionKey] = "The connection was lost while uploading \(megabytes) MB. "
+            + "The provider may not accept uploads of this size."
+        return URLError(urlError.code, userInfo: userInfo)
     }
 
     public static func ensureNetworkAccessIsAllowed() throws {
@@ -286,6 +313,9 @@ public enum PluginHTTPClient {
     }
 
     /// Runs `request` against the shared session, retrying transient failures.
+    /// With a `dedicatedConfiguration`, every attempt runs on a session of its
+    /// own instead, for requests that need longer than the shared session's
+    /// resource timeout.
     ///
     /// Two failure shapes reach this and they are not the same:
     ///
@@ -303,21 +333,34 @@ public enum PluginHTTPClient {
     /// is called out in the pull request rather than silently relied upon.
     private static func dataWithRetries(
         for request: URLRequest,
-        policy: PluginHTTPRetryPolicy
+        policy: PluginHTTPRetryPolicy,
+        dedicatedConfiguration: URLSessionConfiguration? = nil
     ) async throws -> (Data, URLResponse) {
         let deadline = ContinuousClock.now + retrySchedulingBudget
         let method = request.httpMethod ?? "GET"
         let url = request.url?.absoluteString ?? "unknown"
         var attempt = 0
         var usedRetryAfterGrace = false
+        // Restarts after losing the session-invalidation race sent nothing, so
+        // they are bounded separately and leave `attempt` (and with it the
+        // first transport retry) untouched.
+        var unsentRestarts = 0
 
         while true {
-            let session = sharedOrCreateSession()
-            logger.info("\(method) \(url) (attempt \(attempt + 1))")
+            let session = dedicatedConfiguration.map { sessionFactory($0) } ?? sharedOrCreateSession()
+            defer {
+                if dedicatedConfiguration != nil {
+                    session.finishTasksAndInvalidate()
+                }
+            }
+            let sessionDescription = dedicatedConfiguration.map {
+                ", dedicated session, resourceTimeout=\($0.timeoutIntervalForResource)"
+            } ?? ""
+            logger.info("\(method) \(url) (attempt \(attempt + 1)\(sessionDescription))")
             let start = ContinuousClock.now
 
             do {
-                let (data, response) = try await session.data(for: request)
+                let (data, response) = try await dataStartingFreshAfterCancellation(for: request, on: session)
                 let elapsed = ContinuousClock.now - start
                 let status = (response as? HTTPURLResponse)?.statusCode ?? 0
                 logger.info("\(method) \(url) -> \(status) (\(elapsed))")
@@ -377,12 +420,42 @@ public enum PluginHTTPClient {
                 try await sleeper(delay)
             } catch {
                 let elapsed = ContinuousClock.now - start
+                // Another request's cancellation can invalidate the shared session
+                // after this request borrowed it but before its task started. That
+                // surfaces as `.cancelled` although this task was not cancelled.
+                // `finishTasksAndInvalidate()` lets running tasks finish, so on a
+                // session that is no longer the shared one, `.cancelled` means the
+                // task was created after the invalidation and sent nothing; only
+                // then is it safe to start over, even for a POST.
+                if dedicatedConfiguration == nil,
+                   (error as? URLError)?.code == .cancelled,
+                   !Task.isCancelled,
+                   !isCurrentSharedSession(session),
+                   unsentRestarts < retryMaxAttempts {
+                    unsentRestarts += 1
+                    logger.warning("\(method) \(url) cancelled by an invalidated session, retrying on a fresh one")
+                    continue
+                }
                 guard isTransientNetworkError(error) else {
                     logger.error("\(method) \(url) failed after \(elapsed): \(error.localizedDescription)")
                     throw error
                 }
+                // A dedicated request is a long upload or transcription. After it
+                // timed out, the provider may still be working on it, and a second
+                // attempt would double a wait of up to hours. After a connection
+                // lost mid-request, the provider may already have accepted it, and
+                // a POST sent again can create and bill a second job. Failures
+                // before a connection existed are still retried.
+                if dedicatedConfiguration != nil,
+                   let code = (error as? URLError)?.code,
+                   code == .timedOut || (code == .networkConnectionLost && !isIdempotentMethod(method)) {
+                    logger.error("\(method) \(url) failed after \(elapsed) on a dedicated session, not retrying: \(error.localizedDescription)")
+                    throw describingRejectedLargeUpload(error, request: request)
+                }
 
-                resetSharedSession(matching: session, reason: "transient network error")
+                if dedicatedConfiguration == nil {
+                    resetSharedSession(matching: session, reason: "transient network error")
+                }
 
                 // Compatibility, and it applies under BOTH policies: one immediate
                 // retry after the reset, for ANY transient error. This is exactly what
@@ -404,13 +477,31 @@ public enum PluginHTTPClient {
                       let delay = backoffDelay(forAttempt: attempt, deadline: deadline, retryAfter: nil)
                 else {
                     logger.error("\(method) \(url) transient failure after \(elapsed), not retrying further: \(error.localizedDescription)")
-                    throw error
+                    throw describingRejectedLargeUpload(error, request: request)
                 }
 
                 attempt += 1
                 logger.warning("\(method) \(url) transient failure after \(elapsed), retrying in \(delay) (attempt \(attempt + 1)): \(error.localizedDescription)")
                 try await sleeper(delay)
             }
+        }
+    }
+
+    /// Cancelling a request mid-upload can leave its pooled connection broken while
+    /// the session still hands it out. When a live preview was cancelled at the end
+    /// of a dictation, the final transcription started on that connection 28 ms later
+    /// and hung until its request timeout (#1532). The reset runs in the cancellation
+    /// handler, synchronously with `Task.cancel()`, so it lands before any request the
+    /// caller starts next.
+    private static func dataStartingFreshAfterCancellation(
+        for request: URLRequest,
+        on session: any PluginHTTPClientSession
+    ) async throws -> (Data, URLResponse) {
+        nonisolated(unsafe) let cancelledSession = session
+        return try await withTaskCancellationHandler {
+            try await session.data(for: request)
+        } onCancel: {
+            resetSharedSession(matching: cancelledSession, reason: "request cancelled")
         }
     }
 
@@ -585,6 +676,10 @@ public enum PluginHTTPClient {
             return false
         }
     }
+    private static func isCurrentSharedSession(_ session: any PluginHTTPClientSession) -> Bool {
+        lock.withLock { sharedSession === session }
+    }
+
     private static func resetSharedSession(matching session: any PluginHTTPClientSession, reason: String) {
         let didRemoveSharedSession = lock.withLock {
             guard let current = sharedSession, current === session else {
@@ -985,6 +1080,16 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         self.responseFormat = responseFormat
     }
 
+    /// gpt-4o-transcribe and gpt-4o-mini-transcribe return at most 2,000
+    /// tokens, which fast speech reaches in about eight minutes.
+    public static func maximumChunkDuration(forModel modelName: String) -> TimeInterval {
+        let model = modelName.lowercased()
+        guard model.contains("gpt-4o"), model.contains("transcribe") else {
+            return PluginAudioChunking.defaultMaximumChunkDuration
+        }
+        return 300
+    }
+
     func normalizedAudioForUpload(_ audio: AudioData) -> AudioData {
         guard audio.duration < Self.minimumUploadDuration else { return audio }
 
@@ -1033,17 +1138,22 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         responseFormat: String? = nil,
         apiVersion: String?
     ) async throws -> PluginTranscriptionResult {
-        try await performTranscribe(
-            audio: audio,
-            apiKey: apiKey,
-            modelName: modelName,
-            language: language,
-            translate: translate,
-            prompt: prompt,
-            responseFormat: responseFormat,
-            requestTimeout: Self.defaultRequestTimeout,
-            apiVersion: apiVersion
-        )
+        try await PluginAudioChunking.transcribe(
+            audio,
+            maximumChunkDuration: Self.maximumChunkDuration(forModel: modelName)
+        ) { chunk in
+            try await performTranscribe(
+                audio: chunk,
+                apiKey: apiKey,
+                modelName: modelName,
+                language: language,
+                translate: translate,
+                prompt: prompt,
+                responseFormat: responseFormat,
+                requestTimeout: Self.defaultRequestTimeout,
+                apiVersion: apiVersion
+            )
+        }
     }
 
     public func transcribe(
@@ -1080,17 +1190,22 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         responseFormat: String? = nil,
         apiVersion: String?
     ) async throws -> PluginTranscriptionResult {
-        try await performTranscribe(
-            audio: audio,
-            apiKey: apiKey,
-            modelName: modelName,
-            language: language,
-            translate: translate,
-            prompt: prompt,
-            responseFormat: responseFormat,
-            requestTimeout: requestTimeout,
-            apiVersion: apiVersion
-        )
+        try await PluginAudioChunking.transcribe(
+            audio,
+            maximumChunkDuration: Self.maximumChunkDuration(forModel: modelName)
+        ) { chunk in
+            try await performTranscribe(
+                audio: chunk,
+                apiKey: apiKey,
+                modelName: modelName,
+                language: language,
+                translate: translate,
+                prompt: prompt,
+                responseFormat: responseFormat,
+                requestTimeout: requestTimeout,
+                apiVersion: apiVersion
+            )
+        }
     }
 
     public func transcribeCompressedAudio(
@@ -1127,28 +1242,33 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         responseFormat: String? = nil,
         apiVersion: String?
     ) async throws -> PluginTranscriptionResult {
-        let uploadAudio = normalizedAudioForUpload(audio)
-        let uploadFile: PluginAudioUploadFile
-        do {
-            uploadFile = try PluginAudioUploadEncoder.compressedM4AUpload(from: uploadAudio)
-        } catch {
-            throw PluginTranscriptionError.apiError(
-                "Failed to encode compressed upload: \(error.localizedDescription)"
+        try await PluginAudioChunking.transcribe(
+            audio,
+            maximumChunkDuration: Self.maximumChunkDuration(forModel: modelName)
+        ) { chunk in
+            let uploadAudio = normalizedAudioForUpload(chunk)
+            let uploadFile: PluginAudioUploadFile
+            do {
+                uploadFile = try PluginAudioUploadEncoder.compressedM4AUpload(from: uploadAudio)
+            } catch {
+                throw PluginTranscriptionError.apiError(
+                    "Failed to encode compressed upload: \(error.localizedDescription)"
+                )
+            }
+
+            return try await performTranscribe(
+                audio: uploadAudio,
+                apiKey: apiKey,
+                modelName: modelName,
+                language: language,
+                translate: translate,
+                prompt: prompt,
+                responseFormat: responseFormat,
+                requestTimeout: requestTimeout,
+                uploadFile: uploadFile,
+                apiVersion: apiVersion
             )
         }
-
-        return try await performTranscribe(
-            audio: uploadAudio,
-            apiKey: apiKey,
-            modelName: modelName,
-            language: language,
-            translate: translate,
-            prompt: prompt,
-            responseFormat: responseFormat,
-            requestTimeout: requestTimeout,
-            uploadFile: uploadFile,
-            apiVersion: apiVersion
-        )
     }
 
     public func transcribeCompressedAudioWithWavFallback(
@@ -1185,11 +1305,28 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         responseFormat: String? = nil,
         apiVersion: String?
     ) async throws -> PluginTranscriptionResult {
-        let uploadAudio = normalizedAudioForUpload(audio)
-        let preferredUpload: PluginAudioUploadFile
-        do {
-            preferredUpload = try PluginAudioUploadEncoder.compressedM4AUpload(from: uploadAudio)
-        } catch {
+        try await PluginAudioChunking.transcribe(
+            audio,
+            maximumChunkDuration: Self.maximumChunkDuration(forModel: modelName)
+        ) { chunk in
+            let uploadAudio = normalizedAudioForUpload(chunk)
+            let preferredUpload: PluginAudioUploadFile
+            do {
+                preferredUpload = try PluginAudioUploadEncoder.compressedM4AUpload(from: uploadAudio)
+            } catch {
+                return try await performTranscribe(
+                    audio: uploadAudio,
+                    apiKey: apiKey,
+                    modelName: modelName,
+                    language: language,
+                    translate: translate,
+                    prompt: prompt,
+                    responseFormat: responseFormat,
+                    requestTimeout: requestTimeout,
+                    apiVersion: apiVersion
+                )
+            }
+
             return try await performTranscribe(
                 audio: uploadAudio,
                 apiKey: apiKey,
@@ -1199,23 +1336,11 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
                 prompt: prompt,
                 responseFormat: responseFormat,
                 requestTimeout: requestTimeout,
-                apiVersion: apiVersion
+                uploadFile: preferredUpload,
+                apiVersion: apiVersion,
+                allowsWavFallback: true
             )
         }
-
-        return try await performTranscribe(
-            audio: uploadAudio,
-            apiKey: apiKey,
-            modelName: modelName,
-            language: language,
-            translate: translate,
-            prompt: prompt,
-            responseFormat: responseFormat,
-            requestTimeout: requestTimeout,
-            uploadFile: preferredUpload,
-            apiVersion: apiVersion,
-            allowsWavFallback: true
-        )
     }
 
     public func transcribeWithUploadFallback(
@@ -1332,7 +1457,8 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         requestTimeout: TimeInterval,
         uploadFile: PluginAudioUploadFile? = nil,
         apiVersion: String? = nil,
-        allowsWavFallback: Bool = false
+        allowsWavFallback: Bool = false,
+        requestsWordTimings: Bool? = nil
     ) async throws -> PluginTranscriptionResult {
         let path = translate ? "/v1/audio/translations" : "/v1/audio/transcriptions"
         guard let url = requestURL(path: path, apiVersion: apiVersion) else {
@@ -1363,6 +1489,18 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         // response_format field
         let format = responseFormat ?? self.responseFormat
         body.appendFormField(boundary: boundary, name: "response_format", value: format)
+
+        // Word timestamps, when the host collects them and the server takes the parameter.
+        let requestsWordTimings = requestsWordTimings ?? (
+            PluginWordTimings.collector != nil
+                && format == "verbose_json"
+                && !translate
+                && !Self.serversWithoutWordTimings.withLock { $0.contains(baseURL) }
+        )
+        if requestsWordTimings {
+            body.appendFormField(boundary: boundary, name: "timestamp_granularities[]", value: "word")
+            body.appendFormField(boundary: boundary, name: "timestamp_granularities[]", value: "segment")
+        }
 
         // language field (only for transcription)
         if !translate, let language, !language.isEmpty {
@@ -1403,6 +1541,28 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
             )
         }
 
+        // A server that does not know the word timestamp parameter gets the
+        // request again without it. Only when that request succeeds was the
+        // parameter the problem, and the server is not asked for words again.
+        if requestsWordTimings, [400, 422].contains(httpResponse.statusCode) {
+            let result = try await performTranscribe(
+                audio: audio,
+                apiKey: apiKey,
+                modelName: modelName,
+                language: language,
+                translate: translate,
+                prompt: prompt,
+                responseFormat: responseFormat,
+                requestTimeout: requestTimeout,
+                uploadFile: uploadFile,
+                apiVersion: apiVersion,
+                allowsWavFallback: allowsWavFallback,
+                requestsWordTimings: false
+            )
+            Self.serversWithoutWordTimings.withLock { _ = $0.insert(baseURL) }
+            return result
+        }
+
         switch httpResponse.statusCode {
         case 200:
             break
@@ -1421,6 +1581,13 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         }
 
         return try parseResponse(responseData, response: httpResponse)
+    }
+
+    /// Base URLs whose server rejected the word timestamp parameter.
+    private static let serversWithoutWordTimings = OSAllocatedUnfairLock<Set<String>>(initialState: [])
+
+    @_spi(Testing) public static func resetWordTimingSupportForTesting() {
+        serversWithoutWordTimings.withLock { $0 = [] }
     }
 
     public func validateApiKey(_ apiKey: String) async -> Bool {
@@ -1468,10 +1635,17 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
         let text: String
     }
 
+    private struct APIWord: Decodable {
+        let word: String
+        let start: Double
+        let end: Double
+    }
+
     private struct APIResponse: Decodable {
         let text: String
         let language: String?
         let segments: [APISegment]?
+        let words: [APIWord]?
     }
 
     private func parseResponse(
@@ -1491,6 +1665,12 @@ public struct PluginOpenAITranscriptionHelper: Sendable {
             let response = try JSONDecoder().decode(APIResponse.self, from: data)
             let segments = (response.segments ?? []).map {
                 PluginTranscriptionSegment(text: $0.text, start: $0.start, end: $0.end)
+            }
+            if let words = response.words, !words.isEmpty {
+                PluginWordTimings.report(words.compactMap {
+                    let text = $0.word.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return text.isEmpty ? nil : PluginWordTiming(text: text, start: $0.start, end: $0.end)
+                })
             }
             return PluginTranscriptionResult(text: response.text, detectedLanguage: response.language, segments: segments)
         } catch {
@@ -1686,6 +1866,12 @@ public struct PluginOpenAIChatHelper: Sendable {
               let first = choices.first,
               let message = first["message"] as? [String: Any] else {
             throw PluginChatError.apiError("Failed to parse response")
+        }
+
+        // A reply cut off at the token limit is not the finished text. Failing
+        // here lets the caller fall back instead of pasting a partial result.
+        if (first["finish_reason"] as? String) == "length" {
+            throw PluginChatError.outputTruncated(limit: maxOutputTokens)
         }
 
         return Self.chatMessageContent(from: message).trimmingCharacters(in: .whitespacesAndNewlines)

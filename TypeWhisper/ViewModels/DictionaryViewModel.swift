@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import UniformTypeIdentifiers
 import Combine
+import TypeWhisperPluginSDK
 
 // MARK: - Activated Term Pack State
 
@@ -12,6 +13,12 @@ struct ActivatedTermPackState: Codable {
     let installedTerms: [String]
     let installedCorrections: [TermPackCorrection]
     let requiresCommercialLicense: Bool?
+}
+
+/// Per-entry settings of a deactivated pack, restored when the pack is activated again.
+struct TermPackEntryOverride: Codable, Equatable {
+    let isEnabled: Bool
+    let ctcMinSimilarity: Float?
 }
 
 private func dictionaryReplacementDisplayText(_ replacement: String) -> String {
@@ -106,6 +113,46 @@ struct DictionaryResetRequest: Identifiable, Equatable {
     }
 }
 
+// MARK: - Dictionary Terms Setting Suggestion
+
+enum DictionaryTermsSettingActivation: Equatable {
+    case enabling
+    case failed(String)
+}
+
+struct DictionaryTermsSettingSuggestion: Equatable {
+    let providerId: String
+    let engineName: String
+    let summary: String
+    let activation: DictionaryTermsSettingActivation?
+}
+
+/// Decides when the Dictionary page suggests the plugin setting an engine needs for Terms.
+enum DictionaryTermsSettingSuggestionPolicy {
+    /// Adding Terms raises the suggestion when the selected engine ignores them until a
+    /// plugin setting is on, the plugin can turn it on, and the user has not declined.
+    static func shouldSuggest(
+        afterAdding addedType: DictionaryEntryType,
+        support: DictionaryTermsSupport?,
+        canEnable: Bool,
+        isDismissed: Bool
+    ) -> Bool {
+        addedType == .term && support == .requiresPluginSetting && canEnable && !isDismissed
+    }
+
+    /// A raised suggestion stays while the setting is off or while enabling runs or failed,
+    /// so download progress and errors remain visible after the plugin reports support.
+    static func isVisible(
+        support: DictionaryTermsSupport?,
+        canEnable: Bool,
+        isDismissed: Bool,
+        activation: DictionaryTermsSettingActivation?
+    ) -> Bool {
+        guard canEnable, !isDismissed else { return false }
+        return activation != nil || support == .requiresPluginSetting
+    }
+}
+
 // MARK: - Dictionary ViewModel
 
 @MainActor
@@ -164,6 +211,13 @@ class DictionaryViewModel: ObservableObject {
 
     // Term Packs
     @Published var activatedPackStates: [String: ActivatedTermPackState] = [:]
+    /// Pack ID → entry key → settings the user changed before deactivating that pack.
+    private var inactivePackEntryOverrides: [String: [String: TermPackEntryOverride]] = [:]
+
+    // Engine setting suggestion for Terms
+    @Published private(set) var termsSettingSuggestionProviderId: String?
+    @Published private(set) var termsSettingActivations: [String: DictionaryTermsSettingActivation] = [:]
+    @Published private var dismissedTermsSettingProviderIds: Set<String> = []
 
     static let strongCtcMinSimilarity: Double = 0.50
     static let balancedCtcMinSimilarity: Double = 0.65
@@ -175,6 +229,8 @@ class DictionaryViewModel: ObservableObject {
     private let licenseService: LicenseService?
     private let termPackRegistryService: TermPackRegistryService?
     private let defaults: UserDefaults
+    private let selectedTranscriptionEngine: @MainActor () -> (any TranscriptionEnginePlugin)?
+    private let transcriptionEngineLookup: @MainActor (String) -> (any TranscriptionEnginePlugin)?
     private var cancellables = Set<AnyCancellable>()
     private var selectedEntry: DictionaryEntry?
 
@@ -261,15 +317,26 @@ class DictionaryViewModel: ObservableObject {
         dictionaryService: DictionaryService,
         licenseService: LicenseService? = nil,
         termPackRegistryService: TermPackRegistryService? = nil,
-        defaults: UserDefaults = .standard
+        defaults: UserDefaults = .standard,
+        selectedTranscriptionEngine: @escaping @MainActor () -> (any TranscriptionEnginePlugin)? = { nil },
+        transcriptionEngineLookup: @escaping @MainActor (String) -> (any TranscriptionEnginePlugin)? = {
+            PluginManager.shared?.transcriptionEngine(for: $0)
+        }
     ) {
         self.dictionaryService = dictionaryService
         self.licenseService = licenseService
         self.termPackRegistryService = termPackRegistryService
         self.defaults = defaults
+        self.selectedTranscriptionEngine = selectedTranscriptionEngine
+        self.transcriptionEngineLookup = transcriptionEngineLookup
         self.entries = dictionaryService.entries
+        self.dismissedTermsSettingProviderIds = Set(
+            defaults.stringArray(forKey: UserDefaultsKeys.dismissedDictionaryTermsSettingSuggestions) ?? []
+        )
         migrateLegacyActivatedPacks()
         loadActivatedPackStates()
+        loadInactivePackEntryOverrides()
+        migratePackTermsToPreciseBoosting()
         reconcileCommercialPackAccess()
         setupBindings()
     }
@@ -378,6 +445,7 @@ class DictionaryViewModel: ObservableObject {
                 caseSensitive: editCaseSensitive,
                 ctcMinSimilarity: ctcMinSimilarity
             )
+            suggestTermsSettingIfNeeded(afterAdding: editType)
         } else if let entry = selectedEntry {
             dictionaryService.updateEntry(
                 entry,
@@ -500,6 +568,8 @@ class DictionaryViewModel: ObservableObject {
                 try dictionaryService.deleteEntries(ids: ids)
                 activatedPackStates = [:]
                 saveActivatedPackStates()
+                inactivePackEntryOverrides = [:]
+                saveInactivePackEntryOverrides()
             }
         } catch {
             self.error = error.localizedDescription
@@ -594,6 +664,105 @@ class DictionaryViewModel: ObservableObject {
         return .advanced
     }
 
+    // MARK: - Engine Setting Suggestion
+
+    /// The suggestion shown above the dictionary, if the last added Terms raised one.
+    var visibleTermsSettingSuggestion: DictionaryTermsSettingSuggestion? {
+        guard let providerId = termsSettingSuggestionProviderId,
+              let engine = transcriptionEngineLookup(providerId),
+              let enabler = engine as? any DictionaryTermsSettingEnabling else {
+            return nil
+        }
+        let activation = termsSettingActivations[providerId]
+        guard DictionaryTermsSettingSuggestionPolicy.isVisible(
+            support: enabler.dictionaryTermsSupport,
+            canEnable: true,
+            isDismissed: dismissedTermsSettingProviderIds.contains(providerId),
+            activation: activation
+        ) else {
+            return nil
+        }
+        return DictionaryTermsSettingSuggestion(
+            providerId: providerId,
+            engineName: engine.providerDisplayName,
+            summary: enabler.dictionaryTermsSettingSummary,
+            activation: activation
+        )
+    }
+
+    func suggestTermsSettingIfNeeded(afterAdding addedType: DictionaryEntryType) {
+        guard addedType == .term, let engine = selectedTranscriptionEngine() else { return }
+        let providerId = engine.providerId
+        guard DictionaryTermsSettingSuggestionPolicy.shouldSuggest(
+            afterAdding: addedType,
+            support: (engine as? any DictionaryTermsCapabilityProviding)?.dictionaryTermsSupport,
+            canEnable: engine is any DictionaryTermsSettingEnabling,
+            isDismissed: dismissedTermsSettingProviderIds.contains(providerId)
+        ) else {
+            return
+        }
+        termsSettingSuggestionProviderId = providerId
+    }
+
+    func termsSettingActivation(for providerId: String) -> DictionaryTermsSettingActivation? {
+        termsSettingActivations[providerId]
+    }
+
+    func enableTermsSetting(for engine: any TranscriptionEnginePlugin) {
+        guard let enabler = engine as? any DictionaryTermsSettingEnabling else { return }
+        let providerId = engine.providerId
+        guard termsSettingActivations[providerId] != .enabling else { return }
+
+        termsSettingActivations[providerId] = .enabling
+        Task { [weak self] in
+            do {
+                try await enabler.enableDictionaryTermsSetting()
+                self?.finishTermsSettingActivation(providerId: providerId, failure: nil)
+            } catch {
+                self?.finishTermsSettingActivation(providerId: providerId, failure: error.localizedDescription)
+            }
+        }
+    }
+
+    func enableSuggestedTermsSetting() {
+        guard let providerId = termsSettingSuggestionProviderId,
+              let engine = transcriptionEngineLookup(providerId) else { return }
+        enableTermsSetting(for: engine)
+    }
+
+    /// "Not now" is remembered per engine, so adding more Terms does not ask again.
+    /// The engine overview keeps offering the setting.
+    func dismissTermsSettingSuggestion() {
+        guard let providerId = termsSettingSuggestionProviderId else { return }
+        termsSettingSuggestionProviderId = nil
+        if case .failed = termsSettingActivations[providerId] {
+            termsSettingActivations[providerId] = nil
+        }
+        dismissedTermsSettingProviderIds.insert(providerId)
+        defaults.set(
+            dismissedTermsSettingProviderIds.sorted(),
+            forKey: UserDefaultsKeys.dismissedDictionaryTermsSettingSuggestions
+        )
+    }
+
+    /// The suggestion belongs to the moment Terms were added; leaving the page ends it.
+    func clearTermsSettingSuggestion() {
+        guard let providerId = termsSettingSuggestionProviderId,
+              termsSettingActivations[providerId] == nil else { return }
+        termsSettingSuggestionProviderId = nil
+    }
+
+    private func finishTermsSettingActivation(providerId: String, failure: String?) {
+        if let failure {
+            termsSettingActivations[providerId] = .failed(failure)
+        } else {
+            termsSettingActivations[providerId] = nil
+            if termsSettingSuggestionProviderId == providerId {
+                termsSettingSuggestionProviderId = nil
+            }
+        }
+    }
+
     // MARK: - Export / Import
 
     func exportDictionary() {
@@ -616,7 +785,11 @@ class DictionaryViewModel: ObservableObject {
                 error = String(localized: "The file contains no dictionary entries.")
                 return
             }
+            let termsCountBeforeImport = dictionaryService.termsCount
             let result = DictionaryExporter.importEntries(parsed, into: dictionaryService)
+            if dictionaryService.termsCount > termsCountBeforeImport {
+                suggestTermsSettingIfNeeded(afterAdding: .term)
+            }
 
             if result.skipped > 0 {
                 importMessage = String(localized: "\(result.imported) entries imported, \(result.skipped) duplicates skipped.")
@@ -644,6 +817,9 @@ class DictionaryViewModel: ObservableObject {
             deactivatePack(pack)
         } else {
             activatePack(pack)
+            if isPackActivated(pack), !pack.terms.isEmpty {
+                suggestTermsSettingIfNeeded(afterAdding: .term)
+            }
         }
     }
 
@@ -722,7 +898,6 @@ class DictionaryViewModel: ObservableObject {
 
     // MARK: - Reconciliation
 
-    /// Removes all pack-generated entries, then re-applies all active packs in deterministic order.
     private func makeActivatedState(for pack: TermPack) -> ActivatedTermPackState {
         ActivatedTermPackState(
             packID: pack.id,
@@ -734,14 +909,35 @@ class DictionaryViewModel: ObservableObject {
         )
     }
 
+    /// Re-applies all active packs in deterministic order. Entries a pack installed earlier
+    /// stay in place, so per-entry boosting and enabled overrides survive toggling other packs
+    /// and pack updates. Overrides of a deactivated pack are kept until it is activated again.
+    /// Entries that no active pack contains any more are removed.
     private func reconcileActivatedPacks(
         from previousStates: [String: ActivatedTermPackState],
         to nextStates: [String: ActivatedTermPackState]
     ) {
-        // Step 1: Remove only entries that were previously installed by packs.
-        removeSnapshotEntries(from: previousStates)
+        let previouslyManagedIDs = managedPackEntryIDs(from: previousStates)
+        var reusableEntries: [String: DictionaryEntry] = [:]
+        var claimedKeys = Set<String>()
 
-        // Step 2: Re-apply all active packs in deterministic order (built-in first, then community by ID)
+        for entry in dictionaryService.entries {
+            guard let key = Self.packEntryKey(for: entry) else { continue }
+            if previouslyManagedIDs.contains(entry.id) {
+                reusableEntries[key] = reusableEntries[key] ?? entry
+            } else {
+                claimedKeys.insert(key)
+            }
+        }
+
+        var previousOwners: [String: String] = [:]
+        for state in previousStates.values {
+            for key in Self.packEntryKeys(of: state) {
+                previousOwners[key] = previousOwners[key] ?? state.packID
+            }
+        }
+
+        // Built-in packs first, then community packs by ID
         let sortedStates = nextStates.values.sorted { a, b in
             if a.source != b.source {
                 return a.source == "builtIn"
@@ -750,95 +946,165 @@ class DictionaryViewModel: ObservableObject {
         }
 
         var newStates: [String: ActivatedTermPackState] = [:]
+        var entriesToAdd: [(type: DictionaryEntryType, original: String, replacement: String?, caseSensitive: Bool, isEnabled: Bool, ctcMinSimilarity: Float?, source: DictionaryEntrySource)] = []
+        // Reused entries whose pack definition changed spelling or case sensitivity
+        var refreshedEntries: [(entry: DictionaryEntry, original: String, replacement: String?, caseSensitive: Bool)] = []
+
         for state in sortedStates {
-            let actuallyAddedTerms = addTermEntries(state.installedTerms)
-            let actuallyAddedCorrections = addCorrectionEntries(state.installedCorrections)
+            let restoredOverrides = inactivePackEntryOverrides[state.packID] ?? [:]
+
+            var installedTerms: [String] = []
+            for term in state.installedTerms {
+                let key = Self.termKey(term)
+                guard claimedKeys.insert(key).inserted else { continue }
+                installedTerms.append(term)
+                if let entry = reusableEntries.removeValue(forKey: key) {
+                    if entry.original != term {
+                        refreshedEntries.append((entry, term, nil, entry.caseSensitive))
+                    }
+                } else {
+                    let override = restoredOverrides[key]
+                    let ctcMinSimilarity: Float? = if let override {
+                        override.ctcMinSimilarity
+                    } else {
+                        Self.packTermCtcMinSimilarity
+                    }
+                    entriesToAdd.append((
+                        type: .term,
+                        original: term,
+                        replacement: nil,
+                        caseSensitive: true,
+                        isEnabled: override?.isEnabled ?? true,
+                        ctcMinSimilarity: ctcMinSimilarity,
+                        source: .manual
+                    ))
+                }
+            }
+
+            var installedCorrections: [TermPackCorrection] = []
+            for correction in state.installedCorrections {
+                let key = Self.correctionKey(original: correction.original, replacement: correction.replacement)
+                guard claimedKeys.insert(key).inserted else { continue }
+                installedCorrections.append(correction)
+                if let entry = reusableEntries.removeValue(forKey: key) {
+                    if entry.original != correction.original
+                        || entry.replacement != correction.replacement
+                        || entry.caseSensitive != correction.caseSensitive {
+                        refreshedEntries.append((entry, correction.original, correction.replacement, correction.caseSensitive))
+                    }
+                } else {
+                    entriesToAdd.append((
+                        type: .correction,
+                        original: correction.original,
+                        replacement: correction.replacement,
+                        caseSensitive: correction.caseSensitive,
+                        isEnabled: restoredOverrides[key]?.isEnabled ?? true,
+                        ctcMinSimilarity: nil,
+                        source: .manual
+                    ))
+                }
+            }
 
             newStates[state.packID] = ActivatedTermPackState(
                 packID: state.packID,
                 source: state.source,
                 installedVersion: state.installedVersion,
-                installedTerms: actuallyAddedTerms,
-                installedCorrections: actuallyAddedCorrections,
+                installedTerms: installedTerms,
+                installedCorrections: installedCorrections,
                 requiresCommercialLicense: state.requiresCommercialLicense
             )
         }
 
-        // Step 3: Save updated snapshots
+        // Active packs hold their overrides in their entries. Remember changed entries of
+        // deactivated packs; entries an active pack dropped in an update are forgotten.
+        var nextOverrides = inactivePackEntryOverrides.filter { nextStates[$0.key] == nil }
+        for (key, entry) in reusableEntries {
+            guard let owner = previousOwners[key], nextStates[owner] == nil,
+                  let override = Self.packEntryOverride(for: entry) else { continue }
+            nextOverrides[owner, default: [:]][key] = override
+        }
+
+        // Remove stale entries before adding, so a changed correction replacement can take the original's place.
+        if !reusableEntries.isEmpty {
+            dictionaryService.deleteEntries(Array(reusableEntries.values))
+        }
+        for (entry, original, replacement, caseSensitive) in refreshedEntries {
+            dictionaryService.updateEntry(
+                entry,
+                original: original,
+                replacement: replacement,
+                caseSensitive: caseSensitive,
+                ctcMinSimilarity: entry.ctcMinSimilarity
+            )
+        }
+        dictionaryService.importEntries(entriesToAdd)
+
         activatedPackStates = newStates
         saveActivatedPackStates()
+        inactivePackEntryOverrides = nextOverrides
+        saveInactivePackEntryOverrides()
     }
 
-    private func removeSnapshotEntries(from states: [String: ActivatedTermPackState]) {
-        let ids = managedPackEntryIDs(from: states)
-        guard !ids.isEmpty else { return }
+    /// Pack terms start at Precise boosting: packs carry many terms that sit close to everyday words,
+    /// so the size-dependent Auto threshold lets them replace ordinary speech.
+    private static let packTermCtcMinSimilarity = Float(preciseCtcMinSimilarity)
 
-        let entriesToDelete = dictionaryService.entries.filter { ids.contains($0.id) }
-        dictionaryService.deleteEntries(entriesToDelete)
+    private static func termKey(_ term: String) -> String {
+        "term:\(term.lowercased())"
+    }
+
+    private static func packEntryKey(for entry: DictionaryEntry) -> String? {
+        switch entry.type {
+        case .term:
+            return termKey(entry.original)
+        case .correction:
+            guard let replacement = entry.replacement else { return nil }
+            return correctionKey(original: entry.original, replacement: replacement)
+        }
+    }
+
+    private static func packEntryKeys(of state: ActivatedTermPackState) -> [String] {
+        state.installedTerms.map(termKey) + state.installedCorrections.map {
+            correctionKey(original: $0.original, replacement: $0.replacement)
+        }
+    }
+
+    /// Returns nil when the entry still has the pack defaults.
+    private static func packEntryOverride(for entry: DictionaryEntry) -> TermPackEntryOverride? {
+        let ctcMinSimilarity = entry.type == .term ? entry.ctcMinSimilarity : nil
+        let defaultCtcMinSimilarity = entry.type == .term ? packTermCtcMinSimilarity : nil
+        guard !entry.isEnabled || ctcMinSimilarity != defaultCtcMinSimilarity else { return nil }
+        return TermPackEntryOverride(isEnabled: entry.isEnabled, ctcMinSimilarity: ctcMinSimilarity)
+    }
+
+    private static func correctionKey(original: String, replacement: String) -> String {
+        "correction:\(original.lowercased())|\(replacement.lowercased())"
     }
 
     private func managedPackEntryIDs(
         from states: [String: ActivatedTermPackState]? = nil
     ) -> Set<UUID> {
-        var termsToRemove = Set<String>()
-        var correctionsToRemove = Set<String>() // "original|replacement" keys
-
-        for state in (states ?? activatedPackStates).values {
-            for term in state.installedTerms {
-                termsToRemove.insert(term.lowercased())
-            }
-            for correction in state.installedCorrections {
-                correctionsToRemove.insert("\(correction.original.lowercased())|\(correction.replacement.lowercased())")
-            }
-        }
-
+        let keys = Set((states ?? activatedPackStates).values.flatMap(Self.packEntryKeys))
         return Set(dictionaryService.entries.compactMap { entry -> UUID? in
-            if entry.type == .term {
-                return termsToRemove.contains(entry.original.lowercased()) ? entry.id : nil
-            } else if entry.type == .correction, let replacement = entry.replacement {
-                let key = "\(entry.original.lowercased())|\(replacement.lowercased())"
-                return correctionsToRemove.contains(key) ? entry.id : nil
-            }
-            return nil
+            guard let key = Self.packEntryKey(for: entry), keys.contains(key) else { return nil }
+            return entry.id
         })
     }
 
-    /// Adds term entries, skipping any that already exist. Returns the terms that were actually added.
-    private func addTermEntries(_ terms: [String]) -> [String] {
-        let existingOriginals = Set(dictionaryService.entries.filter { $0.type == .term }.map { $0.original.lowercased() })
-        let newTerms = terms.filter { !existingOriginals.contains($0.lowercased()) }
-
-        if !newTerms.isEmpty {
-            let items = newTerms.map {
-                (type: DictionaryEntryType.term, original: $0, replacement: nil as String?, caseSensitive: true)
-            }
-            dictionaryService.addEntries(items)
+    /// Moves pack terms installed with the former Auto default to Precise once.
+    /// Earlier pack toggles and updates reset every pack term to Auto, so Auto is not a deliberate choice here.
+    private func migratePackTermsToPreciseBoosting() {
+        guard !defaults.bool(forKey: UserDefaultsKeys.termPackPreciseBoostingMigrated) else { return }
+        // Retry on a later launch if the dictionary store could not be opened.
+        guard activatedPackStates.isEmpty || !dictionaryService.entries.isEmpty else { return }
+        let managedIDs = managedPackEntryIDs()
+        let autoTermIDs = Set(dictionaryService.entries.filter {
+            managedIDs.contains($0.id) && $0.type == .term && $0.ctcMinSimilarity == nil
+        }.map(\.id))
+        guard dictionaryService.setCtcMinSimilarity(Self.packTermCtcMinSimilarity, forTermEntryIDs: autoTermIDs) else {
+            return
         }
-        return newTerms
-    }
-
-    /// Adds correction entries, skipping any that already exist. Returns the corrections that were actually added.
-    private func addCorrectionEntries(_ corrections: [TermPackCorrection]) -> [TermPackCorrection] {
-        let existingKeys = Set(
-            dictionaryService.entries
-                .filter { $0.type == .correction }
-                .compactMap { entry -> String? in
-                    guard let replacement = entry.replacement else { return nil }
-                    return "\(entry.original.lowercased())|\(replacement.lowercased())"
-                }
-        )
-
-        let newCorrections = corrections.filter { correction in
-            !existingKeys.contains("\(correction.original.lowercased())|\(correction.replacement.lowercased())")
-        }
-
-        if !newCorrections.isEmpty {
-            let items = newCorrections.map {
-                (type: DictionaryEntryType.correction, original: $0.original, replacement: $0.replacement as String?, caseSensitive: $0.caseSensitive)
-            }
-            dictionaryService.addEntries(items)
-        }
-        return newCorrections
+        defaults.set(true, forKey: UserDefaultsKeys.termPackPreciseBoostingMigrated)
     }
 
     // MARK: - Persistence
@@ -858,6 +1124,22 @@ class DictionaryViewModel: ObservableObject {
         let states = Array(activatedPackStates.values)
         if let data = try? JSONEncoder().encode(states) {
             defaults.set(data, forKey: UserDefaultsKeys.activatedTermPackStates)
+        }
+    }
+
+    private func loadInactivePackEntryOverrides() {
+        guard let data = defaults.data(forKey: UserDefaultsKeys.termPackEntryOverrides) else { return }
+        inactivePackEntryOverrides = (try? JSONDecoder().decode(
+            [String: [String: TermPackEntryOverride]].self,
+            from: data
+        )) ?? [:]
+    }
+
+    private func saveInactivePackEntryOverrides() {
+        if inactivePackEntryOverrides.isEmpty {
+            defaults.removeObject(forKey: UserDefaultsKeys.termPackEntryOverrides)
+        } else if let data = try? JSONEncoder().encode(inactivePackEntryOverrides) {
+            defaults.set(data, forKey: UserDefaultsKeys.termPackEntryOverrides)
         }
     }
 

@@ -1,5 +1,7 @@
 import Foundation
+import TypeWhisperPluginSDK
 import os
+import TypeWhisperPluginSDK
 
 private let apiLogger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "typewhisper-mac", category: "APIHandlers")
 
@@ -12,7 +14,9 @@ final class APIHandlers: @unchecked Sendable {
     private let dictionaryService: DictionaryService
     private let dictationViewModel: DictationViewModel
     private let audioRecorderViewModel: AudioRecorderViewModel
+    private let audioDeviceService: AudioDeviceService
     private let settingsBackupService: SettingsBackupAutomationService
+    private let speakerCoordinator: SpeakerTranscriptCoordinator?
 
     init(
         modelManager: ModelManagerService,
@@ -23,7 +27,9 @@ final class APIHandlers: @unchecked Sendable {
         dictionaryService: DictionaryService,
         dictationViewModel: DictationViewModel,
         audioRecorderViewModel: AudioRecorderViewModel,
-        settingsBackupService: SettingsBackupAutomationService
+        audioDeviceService: AudioDeviceService,
+        settingsBackupService: SettingsBackupAutomationService,
+        speakerCoordinator: SpeakerTranscriptCoordinator? = nil
     ) {
         self.modelManager = modelManager
         self.audioFileService = audioFileService
@@ -33,7 +39,9 @@ final class APIHandlers: @unchecked Sendable {
         self.dictionaryService = dictionaryService
         self.dictationViewModel = dictationViewModel
         self.audioRecorderViewModel = audioRecorderViewModel
+        self.audioDeviceService = audioDeviceService
         self.settingsBackupService = settingsBackupService
+        self.speakerCoordinator = speakerCoordinator
     }
 
     func register(on router: APIRouter) {
@@ -58,6 +66,9 @@ final class APIHandlers: @unchecked Sendable {
         router.register("POST", "/v1/recorder/stop", handler: handleStopRecorder)
         router.register("GET", "/v1/recorder/status", handler: handleRecorderStatus)
         router.register("GET", "/v1/recorder/session", handler: handleRecorderSession)
+        router.register("GET", "/v1/recorder/recordings") { [audioRecorderViewModel] request in
+            await Self.recorderRecordingsResponse(for: request, recorder: audioRecorderViewModel)
+        }
         router.register("GET", "/v1/dictionary/terms", handler: handleGetDictionaryTerms)
         router.register("PUT", "/v1/dictionary/terms", handler: handlePutDictionaryTerms)
         router.register("DELETE", "/v1/dictionary/terms", handler: handleDeleteDictionaryTerms)
@@ -66,6 +77,8 @@ final class APIHandlers: @unchecked Sendable {
         router.register("DELETE", "/v1/dictionary/corrections", handler: handleDeleteDictionaryCorrections)
         router.register("GET", "/v1/settings/export", handler: handleExportSettings)
         router.register("POST", "/v1/settings/import", handler: handleImportSettings)
+        router.register("GET", "/v1/settings/audio", handler: handleGetAudioSettings)
+        router.register("PATCH", "/v1/settings/audio", handler: handlePatchAudioSettings)
     }
 
     // MARK: - /v1/settings
@@ -84,15 +97,69 @@ final class APIHandlers: @unchecked Sendable {
         guard !request.body.isEmpty else {
             return .error(status: 400, message: "Request body must contain a TypeWhisper settings backup")
         }
+        guard let mode = SettingsBackupExporter.ImportMode(rawValue: request.queryParams["mode"] ?? "merge") else {
+            return .error(status: 400, message: "mode must be merge or replace")
+        }
 
         do {
-            let result = try await settingsBackupService.importData(request.body)
+            let result = try await settingsBackupService.importData(request.body, mode: mode)
             return .json(result)
         } catch SettingsBackupExporter.ImportError.invalidFile {
             return .error(status: 400, message: "Request body is not a valid TypeWhisper settings backup")
         } catch {
             apiLogger.error("Settings import failed: \(error.localizedDescription, privacy: .public)")
             return .error(status: 500, message: "Could not import TypeWhisper settings")
+        }
+    }
+
+    // MARK: - /v1/settings/audio
+
+    private func handleGetAudioSettings(_ request: HTTPRequest) async -> HTTPResponse {
+        let audioDeviceService = self.audioDeviceService
+        let dictationViewModel = self.dictationViewModel
+        let state = await MainActor.run {
+            APIAudioSettings.state(audioDeviceService: audioDeviceService, dictationViewModel: dictationViewModel)
+        }
+        return .json(state)
+    }
+
+    private func handlePatchAudioSettings(_ request: HTTPRequest) async -> HTTPResponse {
+        let patch: APIAudioSettings.Patch
+        do {
+            patch = try APIAudioSettings.parsePatch(request.body)
+        } catch {
+            return .error(status: 400, message: error.message)
+        }
+
+        let audioDeviceService = self.audioDeviceService
+        let dictationViewModel = self.dictationViewModel
+        let audioRecorderViewModel = self.audioRecorderViewModel
+        return await MainActor.run {
+            guard !APIAudioSettings.isAudioInUse(
+                dictationState: dictationViewModel.state,
+                recorderState: audioRecorderViewModel.state
+            ) else {
+                return .error(status: 409, message: "Audio settings cannot change while TypeWhisper is recording or processing")
+            }
+
+            // Same setters the settings window uses, so the change persists and applies to the next recording.
+            if let inputPriority = patch.inputPriority {
+                audioDeviceService.replaceInputDevicePriorityList(inputPriority)
+            }
+            if let audioDuckingEnabled = patch.audioDuckingEnabled {
+                dictationViewModel.audioDuckingEnabled = audioDuckingEnabled
+            }
+            if let audioDuckingLevel = patch.audioDuckingLevel {
+                dictationViewModel.audioDuckingLevel = audioDuckingLevel
+            }
+            if let pauseMediaDuringRecording = patch.pauseMediaDuringRecording {
+                dictationViewModel.mediaPauseEnabled = pauseMediaDuringRecording
+            }
+            if let soundFeedbackEnabled = patch.soundFeedbackEnabled {
+                dictationViewModel.soundFeedbackEnabled = soundFeedbackEnabled
+            }
+
+            return .json(APIAudioSettings.state(audioDeviceService: audioDeviceService, dictationViewModel: dictationViewModel))
         }
     }
 
@@ -110,6 +177,8 @@ final class APIHandlers: @unchecked Sendable {
         var awaitDownload = false
         var normalizeNumbers: Bool? = nil
         var applyCorrections = true
+        var detectSpeakers = false
+        var speakerCount: Int? = nil
     }
 
     private struct LocalFileTranscribeRequest: Decodable {
@@ -124,6 +193,8 @@ final class APIHandlers: @unchecked Sendable {
         let model: String?
         let normalizeNumbers: Bool?
         let applyCorrections: Bool?
+        let detectSpeakers: Bool?
+        let speakerCount: Int?
 
         enum CodingKeys: String, CodingKey {
             case path
@@ -137,6 +208,8 @@ final class APIHandlers: @unchecked Sendable {
             case model
             case normalizeNumbers = "normalize_numbers"
             case applyCorrections = "apply_corrections"
+            case detectSpeakers = "detect_speakers"
+            case speakerCount = "speaker_count"
         }
     }
 
@@ -227,6 +300,24 @@ final class APIHandlers: @unchecked Sendable {
                 }
                 options.applyCorrections = parsed
             }
+
+            if let speakersPart = parts.first(where: { $0.name == "detect_speakers" }),
+               let val = String(data: speakersPart.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !val.isEmpty {
+                guard let parsed = Self.parseBoolean(val) else {
+                    return .error(status: 400, message: "Invalid 'detect_speakers' value")
+                }
+                options.detectSpeakers = parsed
+            }
+
+            if let countPart = parts.first(where: { $0.name == "speaker_count" }),
+               let val = String(data: countPart.data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !val.isEmpty {
+                guard let parsed = Int(val), parsed > 0 else {
+                    return .error(status: 400, message: "Invalid 'speaker_count' value")
+                }
+                options.speakerCount = parsed
+            }
         } else if !request.body.isEmpty {
             audioData = request.body
             fileExtension = extensionFromMIME(contentType)
@@ -267,6 +358,20 @@ final class APIHandlers: @unchecked Sendable {
                     return .error(status: 400, message: "Invalid 'x-apply-corrections' value")
                 }
                 options.applyCorrections = parsed
+            }
+            if let detectSpeakers = request.headers["x-detect-speakers"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !detectSpeakers.isEmpty {
+                guard let parsed = Self.parseBoolean(detectSpeakers) else {
+                    return .error(status: 400, message: "Invalid 'x-detect-speakers' value")
+                }
+                options.detectSpeakers = parsed
+            }
+            if let speakerCount = request.headers["x-speaker-count"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !speakerCount.isEmpty {
+                guard let parsed = Int(speakerCount), parsed > 0 else {
+                    return .error(status: 400, message: "Invalid 'x-speaker-count' value")
+                }
+                options.speakerCount = parsed
             }
         } else {
             return .error(status: 400, message: "No audio data provided")
@@ -327,6 +432,8 @@ final class APIHandlers: @unchecked Sendable {
         options.modelOverride = payload.model?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
         options.normalizeNumbers = payload.normalizeNumbers
         options.applyCorrections = payload.applyCorrections ?? true
+        options.detectSpeakers = payload.detectSpeakers ?? false
+        options.speakerCount = payload.speakerCount
 
         do {
             let samples = try await audioFileService.loadAudioSamples(from: fileURL)
@@ -393,9 +500,31 @@ final class APIHandlers: @unchecked Sendable {
                 normalizeNumbers: options.normalizeNumbers
             )
 
+            var sourceSegments = result.segments
+            if options.detectSpeakers {
+                guard let speakerCoordinator else {
+                    return .error(status: 503, message: "Speaker detection is not available")
+                }
+                do {
+                    sourceSegments = try await speakerCoordinator.labelingSpeakers(
+                        in: result,
+                        samples: samples,
+                        speakerCount: options.speakerCount
+                    )
+                } catch SpeakerTranscriptCoordinator.StartError.premiumRequired {
+                    return .error(status: 403, message: "Speaker detection requires TypeWhisper Premium")
+                } catch SpeakerTranscriptCoordinator.StartError.providerUnavailable {
+                    return .error(status: 503, message: "Speaker detection is not available")
+                } catch SpeakerTranscriptCoordinator.StartError.timingMissing {
+                    return .error(status: 422, message: "The transcription engine returned no timestamps for speaker detection")
+                } catch PluginDiarizationError.unsupportedSpeakerCount {
+                    return .error(status: 400, message: "Invalid 'speaker_count' value")
+                }
+            }
+
             var finalText = result.text
             var responseLanguage = result.detectedLanguage
-            var responseSegments = result.segments
+            var responseSegments = sourceSegments
             if let targetCode = options.targetLanguage {
                 #if canImport(Translation)
                 if #available(macOS 15, *), let ts = translationService as? TranslationService {
@@ -411,7 +540,7 @@ final class APIHandlers: @unchecked Sendable {
                         )
                         if options.responseFormat == "verbose_json" {
                             responseSegments = try await APITranslation.translateSegments(
-                                result.segments,
+                                sourceSegments,
                                 translation: translation,
                                 translateBatch: { texts, target, source in
                                     try await ts.translateBatch(
@@ -837,6 +966,10 @@ final class APIHandlers: @unchecked Sendable {
         let limit = max(min(Int(request.queryParams["limit"] ?? "") ?? 50, 200), 0)
         let offset = max(Int(request.queryParams["offset"] ?? "") ?? 0, 0)
 
+        let includesSpeakerSegments = request.queryParams["include"]?
+            .split(separator: ",")
+            .contains("speaker_segments") == true
+
         let historyService = self.historyService
         return await MainActor.run {
             let page = historyService.fetchPage(
@@ -844,6 +977,18 @@ final class APIHandlers: @unchecked Sendable {
                 offset: offset,
                 limit: limit
             )
+
+            struct SpeakerEntry: Encodable {
+                let id: String
+                let name: String
+            }
+
+            struct SpeakerSegmentEntry: Encodable {
+                let start: Double
+                let end: Double
+                let speaker: String?
+                let text: String
+            }
 
             struct HistoryEntry: Encodable {
                 let id: String
@@ -858,7 +1003,13 @@ final class APIHandlers: @unchecked Sendable {
                 let engine: String
                 let model: String?
                 let words_count: Int
+                /// `pending`, `ready`, or `failed`; absent without speaker detection.
+                let speaker_state: String?
+                let speakers: [SpeakerEntry]?
+                /// Only with `include=speaker_segments`.
+                let speaker_segments: [SpeakerSegmentEntry]?
             }
+
 
             struct HistoryResponse: Encodable {
                 let entries: [HistoryEntry]
@@ -868,7 +1019,9 @@ final class APIHandlers: @unchecked Sendable {
             }
 
             let entries = page.records.map { record in
-                HistoryEntry(
+                let transcript = record.speakerTranscriptState == nil ? nil : record.speakerTranscript
+                let names = record.speakerNames
+                return HistoryEntry(
                     id: record.id.uuidString,
                     text: record.finalText,
                     raw_text: record.rawText,
@@ -880,7 +1033,22 @@ final class APIHandlers: @unchecked Sendable {
                     language: record.language,
                     engine: record.engineUsed,
                     model: record.modelUsed,
-                    words_count: record.wordsCount
+                    words_count: record.wordsCount,
+                    speaker_state: record.speakerTranscriptState?.rawValue,
+                    speakers: transcript?.speakerIDs.map { speakerID in
+                        // Unnamed speakers get the fixed `Speaker N`, not the localized default name.
+                        // A name only suggested by a voice profile is a guess and is not returned.
+                        SpeakerEntry(
+                            id: speakerID,
+                            name: names?.confirmedEntries.first { $0.speakerID == speakerID }?.displayName
+                                ?? SpeakerTranscriptBuilder.outputLabel(for: speakerID)
+                        )
+                    },
+                    speaker_segments: includesSpeakerSegments
+                        ? transcript?.segments.map {
+                            SpeakerSegmentEntry(start: $0.start, end: $0.end, speaker: $0.speakerID, text: $0.text)
+                        }
+                        : nil
                 )
             }
 
@@ -1450,11 +1618,34 @@ final class APIHandlers: @unchecked Sendable {
                 let words_count: Int
             }
 
+            struct DictationLatencyPayload: Encodable {
+                let complete: Bool
+                let failed: Bool
+                let engine_ready_at_start: Bool?
+                let input_transport: String?
+                let request_to_first_audio_buffer_ms: Double?
+                let preroll_ms: Double
+                let recording_seconds: Double?
+                let stop_to_final_transcript_ms: Double?
+                let post_processing_ms: Double?
+                let llm_post_processing: Bool?
+                let stop_to_insertion_ms: Double?
+                let insertion: String?
+                let paste_verification: String?
+                let paste_verification_failure: String?
+                let stop_to_verified_insertion_ms: Double?
+                let stop_to_clipboard_restored_ms: Double?
+                let engine: String?
+                let model: String?
+                let used_live_result: Bool?
+            }
+
             struct DictationTranscriptionResponse: Encodable {
                 let id: String
                 let status: String
                 let transcription: DictationTranscriptionPayload?
                 let error: String?
+                let latency: DictationLatencyPayload?
             }
 
             let transcription = session.transcription.map {
@@ -1473,11 +1664,41 @@ final class APIHandlers: @unchecked Sendable {
                 )
             }
 
+            let latency = dictationViewModel.apiDictationLatency(id: uuid).map { trace in
+                let pasteVerificationFailure: String? = if case .unverified(let reason)? = trace.pasteVerification {
+                    reason
+                } else {
+                    nil
+                }
+                return DictationLatencyPayload(
+                    complete: trace.isComplete,
+                    failed: trace.failed,
+                    engine_ready_at_start: trace.engineReadyAtStart,
+                    input_transport: trace.inputTransport,
+                    request_to_first_audio_buffer_ms: trace.requestToFirstAudioBufferMs,
+                    preroll_ms: trace.prerollMs,
+                    recording_seconds: trace.recordingSeconds,
+                    stop_to_final_transcript_ms: trace.stopToFinalTranscriptMs,
+                    post_processing_ms: trace.postProcessingMs,
+                    llm_post_processing: trace.llmPostProcessing,
+                    stop_to_insertion_ms: trace.stopToInsertionMs,
+                    insertion: trace.insertion?.rawValue,
+                    paste_verification: trace.pasteVerification?.name,
+                    paste_verification_failure: pasteVerificationFailure,
+                    stop_to_verified_insertion_ms: trace.stopToVerifiedInsertionMs,
+                    stop_to_clipboard_restored_ms: trace.stopToClipboardRestoredMs,
+                    engine: trace.engine,
+                    model: trace.model,
+                    used_live_result: trace.usedLiveResult
+                )
+            }
+
             return .json(DictationTranscriptionResponse(
                 id: session.id.uuidString,
                 status: session.status.rawValue,
                 transcription: transcription,
-                error: session.error
+                error: session.error,
+                latency: latency
             ))
         }
     }
@@ -1568,6 +1789,41 @@ final class APIHandlers: @unchecked Sendable {
             output_file: session.outputFile,
             error: session.error
         ))
+    }
+
+    // MARK: - GET /v1/recorder/recordings
+
+    static func recorderRecordingsResponse(
+        for request: HTTPRequest, recorder: AudioRecorderViewModel
+    ) async -> HTTPResponse {
+        let since: Date?
+        if let value = request.queryParams["since"] {
+            if let seconds = Double(value), seconds.isFinite, seconds >= 0 {
+                since = Date(timeIntervalSince1970: seconds)
+            } else {
+                let formatter = ISO8601DateFormatter()
+                formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+                let fractionalDate = formatter.date(from: value)
+                formatter.formatOptions = [.withInternetDateTime]
+                guard let date = fractionalDate ?? formatter.date(from: value) else {
+                    return .error(status: 400, message: "Invalid 'since': use Unix seconds or an ISO 8601 timestamp")
+                }
+                since = date
+            }
+        } else {
+            since = nil
+        }
+
+        struct RecordingsResponse: Encodable {
+            let recordings: [RecorderTranscriptReadyPayload]
+        }
+        do {
+            return .json(RecordingsResponse(recordings: try await recorder.apiRecorderRecordings(since: since)))
+        } catch {
+            apiLogger.error("Recorder completion lookup failed: \(error.localizedDescription, privacy: .public)")
+            // Do not silently skip unreadable receipts: consumers could advance their cursor past them.
+            return .error(status: 500, message: "Could not read completed Recorder transcripts")
+        }
     }
 
     // MARK: - Helpers

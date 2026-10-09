@@ -1,6 +1,7 @@
 import AudioToolbox
 import AVFoundation
 import XCTest
+import os
 import TypeWhisperPluginSDK
 @testable import TypeWhisper
 
@@ -110,6 +111,30 @@ private final class OutOfOrderRecordingsLoader: @unchecked Sendable {
     }
 }
 
+private final class BlockingRecorderCompletionsLoader: @unchecked Sendable {
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var count = 0
+    private var usedMainThread = false
+
+    var callCount: Int { lock.withLock { count } }
+    var ranOnMainThread: Bool { lock.withLock { usedMainThread } }
+
+    func load(directory: URL, since: Date?) throws -> [RecorderTranscriptReadyPayload] {
+        let invocation = lock.withLock {
+            count += 1
+            usedMainThread = usedMainThread || Thread.isMainThread
+            return count
+        }
+        if invocation == 1 {
+            release.wait()
+            // Simulate a read of a sidecar while its deletion was in progress.
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        return []
+    }
+}
+
 @MainActor
 final class AudioRecorderViewModelTests: XCTestCase {
     private struct RestorableRecorderFixture {
@@ -118,6 +143,343 @@ final class AudioRecorderViewModelTests: XCTestCase {
         let recording: AudioRecorderViewModel.RecordingItem
         let transcriptURL: URL
         let failureURL: URL
+    }
+
+    func testRecorderCompletionsReadOffMainThreadAndRetryConcurrentDeletion() async throws {
+        let probe = BlockingRecorderCompletionsLoader()
+        defer { probe.release.signal() }
+        let directory = makeTemporaryDirectory()
+        let viewModel = makeViewModel(defaults: try makeDefaults(), recorderCompletionsLoader: probe.load)
+        let lookup = Task { try await viewModel.apiRecorderRecordings() }
+        var started = false
+        for _ in 0..<100 {
+            if probe.callCount > 0 { started = true; break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(started)
+        let audioURL = directory.appendingPathComponent("Deleted.wav")
+        try Data("audio".utf8).write(to: audioURL)
+        viewModel.deleteRecording(AudioRecorderViewModel.RecordingItem(
+            url: audioURL, date: Date(), duration: 1, fileSize: 5, transcript: nil, transcriptionFailure: nil
+        ))
+        probe.release.signal()
+        let completions = try await lookup.value
+        XCTAssertTrue(completions.isEmpty)
+        XCTAssertEqual(probe.callCount, 2)
+        XCTAssertFalse(probe.ranOnMainThread)
+    }
+
+    func testRecorderReadyIsEmittedOnlyAfterDurableSaveWithoutLivePreview() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager(groqBehavior: .success("Meeting — Grüße 中文"))
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let viewModel = makeFinalTranscriptionViewModel(defaults: try makeDefaults(), modelManager: modelManager)
+        var events: [RecorderTranscriptReadyPayload] = []
+        var dictationEvents = 0
+        EventBus.shared.emissionObserverForTesting = { event in
+            if case .transcriptionCompleted = event { dictationEvents += 1 }
+            guard case .recorderTranscriptReady(let payload) = event else { return }
+            events.append(payload)
+            XCTAssertTrue(FileManager.default.fileExists(atPath: payload.audioFilePath))
+            do {
+                let savedText = try String(contentsOfFile: payload.transcriptFilePath, encoding: .utf8)
+                let receipt = try JSONDecoder().decode(RecorderTranscriptReadyPayload.self, from:
+                    Data(contentsOf: URL(fileURLWithPath: payload.audioFilePath + ".transcript-ready.json")))
+                XCTAssertEqual(savedText, payload.text)
+                XCTAssertEqual(receipt, payload, "Receipt must be readable before emission")
+            } catch {
+                XCTFail("Event preceded durable save: \(error)")
+            }
+        }
+
+        let sessionID = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        _ = try viewModel.apiStopRecording()
+        _ = try await waitForRecorderSession(viewModel, id: sessionID, status: .completed)
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.text, "Meeting — Grüße 中文")
+        XCTAssertNil(events.first?.markdownFilePath)
+        XCTAssertEqual(dictationEvents, 0, "Recorder must not invoke dictation subscribers such as Memory")
+    }
+
+    func testRecorderReadyCoversManualCalendarAndAPIRecordingsAfterReload() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager(groqBehavior: .success("saved transcript"))
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let directory = makeTemporaryDirectory()
+        let defaults = try makeDefaults()
+        var emitted: [RecorderTranscriptReadyPayload] = []
+        for source in ["manual", "calendar", "api"] {
+            let recorderService = makeRecorderService(
+                recordingsDirectory: directory, outputURL: directory.appendingPathComponent("\(source).wav")
+            )
+            let viewModel = makeViewModel(defaults: defaults, modelManager: modelManager, recorderService: recorderService)
+            viewModel.transcriptionEnabled = true
+            viewModel.livePreviewEnabled = false
+            EventBus.shared.emissionObserverForTesting = { event in
+                if case .recorderTranscriptReady(let payload) = event { emitted.append(payload) }
+            }
+            switch source {
+            case "manual":
+                viewModel.startRecording()
+                try await waitForRecorderState(viewModel, .recording)
+                viewModel.stopRecording()
+            case "calendar":
+                let handle = try await viewModel.startCalendarMeetingRecording(
+                    preferredBaseName: "Meeting", transcriptMetadata: makeCalendarMeetingTranscriptMetadata(title: "Meeting")
+                )
+                try viewModel.stopCalendarMeetingRecording(handle: handle)
+            default:
+                _ = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+                _ = try viewModel.apiStopRecording()
+            }
+            try await waitForRecorderState(viewModel, .idle)
+        }
+        XCTAssertEqual(emitted.count, 3)
+        let calendar = try XCTUnwrap(emitted.first(where: { $0.audioFilePath.hasSuffix("calendar.wav") }))
+        let markdownPath = try XCTUnwrap(calendar.markdownFilePath)
+        XCTAssertTrue(try String(contentsOfFile: markdownPath, encoding: .utf8).contains("saved transcript"))
+
+        let reloaded = makeViewModel(defaults: defaults, recorderService: makeRecorderService(recordingsDirectory: directory))
+        let restored = try await reloaded.apiRecorderRecordings()
+        XCTAssertEqual(restored, emitted)
+        XCTAssertEqual(Set(emitted.map(\.recordingID)).count, 3)
+        let last = try XCTUnwrap(emitted.last)
+        let inclusive = try await reloaded.apiRecorderRecordings(since: last.completedAt)
+        let future = try await reloaded.apiRecorderRecordings(since: last.completedAt.addingTimeInterval(1))
+        XCTAssertEqual(inclusive, [last])
+        XCTAssertTrue(future.isEmpty)
+
+        try FileManager.default.removeItem(atPath: markdownPath)
+        let withoutMarkdown = try await reloaded.apiRecorderRecordings()
+        XCTAssertNil(withoutMarkdown.first(where: { $0.recordingID == calendar.recordingID })?.markdownFilePath)
+        try FileManager.default.removeItem(atPath: last.transcriptFilePath)
+        let withoutTranscript = try await reloaded.apiRecorderRecordings()
+        XCTAssertFalse(withoutTranscript.contains(where: { $0.recordingID == last.recordingID }))
+    }
+
+    func testRecorderRetranscriptionKeepsIDAndDeletionRemovesReceipt() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager(groqBehavior: .success("saved transcript"))
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let directory = makeTemporaryDirectory()
+        let defaults = try makeDefaults()
+        let firstModel = makeFinalTranscriptionViewModel(defaults: defaults, modelManager: modelManager, recordingsDirectory: directory)
+        let sessionID = try await firstModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        _ = try firstModel.apiStopRecording()
+        _ = try await waitForRecorderSession(firstModel, id: sessionID, status: .completed)
+        let initialCompletions = try await firstModel.apiRecorderRecordings()
+        let original = try XCTUnwrap(initialCompletions.first)
+
+        let reloaded = makeViewModel(
+            defaults: defaults, modelManager: modelManager,
+            recorderService: makeRecorderService(recordingsDirectory: directory),
+            audioSamplesLoader: { _ in [0.25, -0.25] }
+        )
+        var events: [RecorderTranscriptReadyPayload] = []
+        EventBus.shared.emissionObserverForTesting = { event in
+            if case .recorderTranscriptReady(let payload) = event { events.append(payload) }
+        }
+        try await waitForRecordingsToLoad(reloaded, count: 1)
+        reloaded.transcribeRecording(try XCTUnwrap(reloaded.recordings.first))
+        try await waitForRetranscriptionToFinish(reloaded)
+        let updatedCompletions = try await reloaded.apiRecorderRecordings()
+        let updated = try XCTUnwrap(updatedCompletions.first)
+        XCTAssertEqual(events, [updated])
+        XCTAssertEqual(updated.recordingID, original.recordingID)
+        XCTAssertNotEqual(updated.completionID, original.completionID)
+        XCTAssertGreaterThanOrEqual(updated.completedAt, original.completedAt)
+        XCTAssertEqual(updatedCompletions.count, 1)
+
+        reloaded.deleteRecording(try XCTUnwrap(reloaded.recordings.first))
+        let afterDeletion = try await reloaded.apiRecorderRecordings()
+        XCTAssertTrue(afterDeletion.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: original.audioFilePath + ".transcript-ready.json"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: original.audioFilePath + ".recording-id.json"))
+    }
+
+    func testRecorderRetranscriptionRecoversIdentityWhenOneSidecarIsCorrupt() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager(groqBehavior: .success("original transcript"))
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let directory = makeTemporaryDirectory()
+        let defaults = try makeDefaults()
+        let firstModel = makeFinalTranscriptionViewModel(defaults: defaults, modelManager: modelManager, recordingsDirectory: directory)
+        let sessionID = try await firstModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        _ = try firstModel.apiStopRecording()
+        _ = try await waitForRecorderSession(firstModel, id: sessionID, status: .completed)
+        let initialCompletions = try await firstModel.apiRecorderRecordings()
+        let original = try XCTUnwrap(initialCompletions.first)
+        var previousCompletionID = original.completionID
+        setupPluginManager(groqBehavior: .success("repaired transcript"))
+
+        for suffix in [".transcript-ready.json", ".recording-id.json"] {
+            try Data("{truncated".utf8).write(to: URL(fileURLWithPath: original.audioFilePath + suffix))
+            let reloaded = makeViewModel(
+                defaults: defaults, modelManager: modelManager,
+                recorderService: makeRecorderService(recordingsDirectory: directory),
+                audioSamplesLoader: { _ in [0.25, -0.25] }
+            )
+            var events: [RecorderTranscriptReadyPayload] = []
+            EventBus.shared.emissionObserverForTesting = { event in
+                if case .recorderTranscriptReady(let payload) = event { events.append(payload) }
+            }
+            try await waitForRecordingsToLoad(reloaded, count: 1)
+            reloaded.transcribeRecording(try XCTUnwrap(reloaded.recordings.first))
+            try await waitForRetranscriptionToFinish(reloaded)
+
+            XCTAssertEqual(events.count, 1, suffix)
+            let repaired = try XCTUnwrap(events.first)
+            XCTAssertEqual(repaired.recordingID, original.recordingID, "Recovery must preserve identity across restarts")
+            XCTAssertNotEqual(repaired.completionID, previousCompletionID)
+            XCTAssertEqual(repaired.text, "repaired transcript")
+            XCTAssertEqual(try String(contentsOfFile: repaired.transcriptFilePath, encoding: .utf8), repaired.text)
+            let persisted = try await reloaded.apiRecorderRecordings()
+            XCTAssertEqual(persisted, [repaired])
+            let identity = try JSONSerialization.jsonObject(with: Data(contentsOf:
+                URL(fileURLWithPath: repaired.audioFilePath + ".recording-id.json"))) as? [String: String]
+            XCTAssertEqual(identity?["recording_id"], original.recordingID.uuidString)
+            previousCompletionID = repaired.completionID
+        }
+
+        for suffix in [".transcript-ready.json", ".recording-id.json"] {
+            try Data("{truncated".utf8).write(to: URL(fileURLWithPath: original.audioFilePath + suffix))
+        }
+        let unrecoverable = makeViewModel(
+            defaults: defaults, modelManager: modelManager,
+            recorderService: makeRecorderService(recordingsDirectory: directory),
+            audioSamplesLoader: { _ in [0.25, -0.25] }
+        )
+        var readyCount = 0
+        EventBus.shared.emissionObserverForTesting = { event in
+            if case .recorderTranscriptReady = event { readyCount += 1 }
+        }
+        try await waitForRecordingsToLoad(unrecoverable, count: 1)
+        unrecoverable.transcribeRecording(try XCTUnwrap(unrecoverable.recordings.first))
+        try await waitForRetranscriptionToFinish(unrecoverable, recordingsSatisfy: {
+            $0.recordings.first?.transcriptionFailure?.phase == .savingTranscript
+        })
+        XCTAssertEqual(readyCount, 0, "Do not mint a different ID if both copies were lost")
+        XCTAssertEqual(try String(contentsOfFile: original.transcriptFilePath, encoding: .utf8), "repaired transcript")
+    }
+
+    func testRecorderReadySkipsFailuresCancellationAndDisabledTranscription() async throws {
+        try preserveStandardDefaults()
+        let cases: [(AudioRecorderMockTranscriptionPlugin.TranscriptionBehavior, Bool)] = [
+            (.failure("provider failure"), true), (.empty, true), (.cancellation, true), (.success("unused"), false)
+        ]
+        for (behavior, transcriptionEnabled) in cases {
+            setupPluginManager(groqBehavior: behavior)
+            let modelManager = ModelManagerService()
+            modelManager.selectProvider("groq")
+            let viewModel = makeFinalTranscriptionViewModel(defaults: try makeDefaults(), modelManager: modelManager)
+            viewModel.transcriptionEnabled = transcriptionEnabled
+            var readyCount = 0
+            EventBus.shared.emissionObserverForTesting = { event in
+                if case .recorderTranscriptReady = event { readyCount += 1 }
+            }
+            _ = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+            _ = try viewModel.apiStopRecording()
+            try await waitForRecorderState(viewModel, .idle)
+            XCTAssertEqual(readyCount, 0)
+            let completions = try await viewModel.apiRecorderRecordings()
+            XCTAssertTrue(completions.isEmpty)
+        }
+    }
+
+    func testRecorderReceiptFailureRestoresPreviousTranscriptWithoutEmitting() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager(groqBehavior: .success("original transcript"))
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let directory = makeTemporaryDirectory()
+        let viewModel = makeViewModel(
+            defaults: try makeDefaults(), modelManager: modelManager,
+            recorderService: makeRecorderService(recordingsDirectory: directory),
+            audioSamplesLoader: { _ in Array(repeating: 0.25, count: 16_000) }
+        )
+        viewModel.transcriptionEnabled = true
+        viewModel.livePreviewEnabled = false
+        let sessionID = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        _ = try viewModel.apiStopRecording()
+        _ = try await waitForRecorderSession(viewModel, id: sessionID, status: .completed)
+        let initialCompletions = try await viewModel.apiRecorderRecordings()
+        let original = try XCTUnwrap(initialCompletions.first)
+        let receiptURL = URL(fileURLWithPath: original.audioFilePath + ".transcript-ready.json")
+        let receiptData = try Data(contentsOf: receiptURL)
+        let identityURL = URL(fileURLWithPath: original.audioFilePath + ".recording-id.json")
+        let identityData = try Data(contentsOf: identityURL)
+        try FileManager.default.setAttributes([.immutable: true], ofItemAtPath: receiptURL.path)
+        defer { try? FileManager.default.setAttributes([.immutable: false], ofItemAtPath: receiptURL.path) }
+        setupPluginManager(groqBehavior: .success("replacement transcript"))
+        var readyCount = 0
+        EventBus.shared.emissionObserverForTesting = { event in
+            if case .recorderTranscriptReady = event { readyCount += 1 }
+        }
+        try await waitForRecordingsToLoad(viewModel, count: 1)
+        viewModel.transcribeRecording(try XCTUnwrap(viewModel.recordings.first))
+        try await waitForRetranscriptionToFinish(viewModel, recordingsSatisfy: {
+            $0.recordings.first?.transcriptionFailure?.phase == .savingTranscript
+        })
+        XCTAssertEqual(readyCount, 0)
+        XCTAssertEqual(try Data(contentsOf: receiptURL), receiptData)
+        XCTAssertEqual(try Data(contentsOf: identityURL), identityData)
+        XCTAssertEqual(try String(contentsOfFile: original.transcriptFilePath, encoding: .utf8), original.text)
+        let afterFailure = try await viewModel.apiRecorderRecordings()
+        XCTAssertEqual(afterFailure, [original])
+    }
+
+    func testRecorderRecordingsAPIValidatesSinceAndUsesExistingAuthorization() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager()
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider("groq")
+        let directory = makeTemporaryDirectory()
+        let viewModel = makeFinalTranscriptionViewModel(defaults: try makeDefaults(), modelManager: modelManager, recordingsDirectory: directory)
+        let sessionID = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        _ = try viewModel.apiStopRecording()
+        _ = try await waitForRecorderSession(viewModel, id: sessionID, status: .completed)
+        let completions = try await viewModel.apiRecorderRecordings()
+        let saved = try XCTUnwrap(completions.first)
+        let router = APIRouter(authenticationProvider: { .required(token: "test-token") })
+        router.register("GET", "/v1/recorder/recordings") { request in
+            await APIHandlers.recorderRecordingsResponse(for: request, recorder: viewModel)
+        }
+        func request(since: String? = nil, authorized: Bool = true) -> HTTPRequest {
+            HTTPRequest(method: "GET", path: "/v1/recorder/recordings",
+                        queryParams: since.map { ["since": $0] } ?? [:],
+                        headers: authorized ? ["authorization": "Bearer test-token"] : [:], body: Data())
+        }
+        let denied = await router.route(request(authorized: false))
+        XCTAssertEqual(denied.status, 401)
+        for invalid in ["", "garbage", "nan", "inf", "-1"] {
+            let response = await router.route(request(since: invalid))
+            XCTAssertEqual(response.status, 400, invalid)
+        }
+        struct Response: Decodable { let recordings: [RecorderTranscriptReadyPayload] }
+        for since in [String(saved.completedAt.timeIntervalSince1970), "1970-01-01T00:00:00Z", "1970-01-01T00:00:00.000Z"] {
+            let response = await router.route(request(since: since))
+            XCTAssertEqual(response.status, 200)
+            XCTAssertEqual(try JSONDecoder().decode(Response.self, from: response.body).recordings, [saved])
+        }
+        let future = await router.route(request(since: String(saved.completedAt.timeIntervalSince1970 + 1)))
+        XCTAssertTrue(try JSONDecoder().decode(Response.self, from: future.body).recordings.isEmpty)
+
+        try Data("corrupt receipt".utf8).write(to: directory.appendingPathComponent("broken.wav.transcript-ready.json"))
+        let failure = await router.route(request())
+        XCTAssertEqual(failure.status, 500, "Never silently advance past an unreadable completion")
+    }
+
+    private func waitForRecorderState(_ viewModel: AudioRecorderViewModel, _ state: AudioRecorderViewModel.RecorderState) async throws {
+        for _ in 0..<100 {
+            if viewModel.state == state { return }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Recorder did not reach \(state)")
     }
 
     func testRecorderFilesAreLoadedOffMainThreadDuringInitialization() throws {
@@ -538,6 +900,54 @@ final class AudioRecorderViewModelTests: XCTestCase {
         XCTAssertFalse(failure.providerError.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         XCTAssertTrue(session.error?.contains(failure.phase.displayName) == true)
         XCTAssertTrue(session.error?.contains(failure.providerError) == true)
+    }
+
+    func testDroppedLiveSessionRecordsFailureInsteadOfSavingPreview() async throws {
+        try preserveStandardDefaults()
+        setupPluginManager()
+        let livePlugin = AudioRecorderDroppingLivePlugin()
+        PluginManager.shared.loadedPlugins.append(LoadedPlugin(
+            manifest: PluginManifest(
+                id: "com.typewhisper.mock.dropping-live",
+                name: "Dropping Live",
+                version: "1.0.0",
+                principalClass: "AudioRecorderDroppingLivePlugin"
+            ),
+            instance: livePlugin,
+            bundle: Bundle.main,
+            sourceURL: makeTemporaryDirectory(),
+            isEnabled: true
+        ))
+        let defaults = try makeDefaults()
+        let modelManager = ModelManagerService()
+        modelManager.selectProvider(livePlugin.providerId)
+        let viewModel = makeFinalTranscriptionViewModel(defaults: defaults, modelManager: modelManager)
+        viewModel.livePreviewEnabled = true
+        var finalPartialTexts: [String] = []
+        EventBus.shared.emissionObserverForTesting = { event in
+            if case .partialTranscriptionUpdate(let payload) = event, payload.isFinal {
+                finalPartialTexts.append(payload.text)
+            }
+        }
+
+        let sessionID = try await viewModel.apiStartRecording(micEnabled: true, systemAudioEnabled: false)
+        for _ in 0..<50 where livePlugin.liveSessionCreateCount == 0 {
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        XCTAssertEqual(livePlugin.liveSessionCreateCount, 1)
+        // The preview froze at the words recognized before the connection dropped.
+        viewModel.partialText = "words before the drop"
+        _ = try viewModel.apiStopRecording()
+
+        let session = try await waitForRecorderSession(viewModel, id: sessionID, status: .failed)
+        XCTAssertNil(session.text)
+        XCTAssertEqual(livePlugin.batchTranscriptionCount, 1)
+
+        try await waitForRecordingsToLoad(viewModel, count: 1)
+        let recording = try XCTUnwrap(viewModel.recordings.first)
+        XCTAssertNil(recording.transcript)
+        XCTAssertEqual(recording.transcriptionFailure?.phase, .finalTranscription)
+        XCTAssertEqual(finalPartialTexts, [])
     }
 
     func testSuccessfulTranscriptSaveClearsPriorRecorderFailure() async throws {
@@ -1670,6 +2080,7 @@ final class AudioRecorderViewModelTests: XCTestCase {
         audioDeviceService: AudioDeviceService = AudioDeviceService(initialInputDevices: [], monitorDeviceChanges: false),
         audioSamplesLoader: AudioRecorderViewModel.AudioSamplesLoader? = nil,
         recordingsLoader: AudioRecorderViewModel.RecordingsLoader? = nil,
+        recorderCompletionsLoader: AudioRecorderViewModel.RecorderCompletionsLoader? = nil,
         livePreviewStartObserver: (() -> Void)? = nil
     ) -> AudioRecorderViewModel {
         setupEventBus()
@@ -1686,6 +2097,7 @@ final class AudioRecorderViewModelTests: XCTestCase {
             defaults: defaults,
             audioSamplesLoader: audioSamplesLoader,
             recordingsLoader: recordingsLoader,
+            recorderCompletionsLoader: recorderCompletionsLoader,
             livePreviewStartObserver: livePreviewStartObserver
         )
     }
@@ -2167,6 +2579,56 @@ private final class AudioRecorderRestorableTranscriptionPlugin: NSObject, Transc
     ) async throws -> PluginTranscriptionResult {
         guard isConfigured else { throw PluginTranscriptionError.notConfigured }
         return PluginTranscriptionResult(text: "restored transcription", detectedLanguage: language)
+    }
+}
+
+/// Its live session drops on every append, and batch transcription fails too.
+private final class AudioRecorderDroppingLivePlugin: NSObject, LiveTranscriptionCapablePlugin, @unchecked Sendable {
+    static let pluginId = "com.typewhisper.mock.dropping-live"
+    static let pluginName = "Dropping Live"
+
+    var providerId: String { "dropping-live" }
+    var providerDisplayName: String { "Dropping Live" }
+    var isConfigured: Bool { true }
+    var transcriptionModels: [PluginModelInfo] { [PluginModelInfo(id: "live", displayName: "Live")] }
+    var selectedModelId: String? { "live" }
+    var supportsTranslation: Bool { false }
+    private let counts = OSAllocatedUnfairLock(initialState: (sessions: 0, batch: 0))
+
+    var liveSessionCreateCount: Int { counts.withLock { $0.sessions } }
+    var batchTranscriptionCount: Int { counts.withLock { $0.batch } }
+
+    required override init() {}
+
+    func activate(host: HostServices) {}
+    func deactivate() {}
+    func selectModel(_ modelId: String) {}
+
+    func transcribe(audio: AudioData, language: String?, translate: Bool, prompt: String?) async throws -> PluginTranscriptionResult {
+        counts.withLock { $0.batch += 1 }
+        throw PluginTranscriptionError.networkError("The Internet connection appears to be offline.")
+    }
+
+    func createLiveTranscriptionSession(
+        language: String?,
+        translate: Bool,
+        prompt: String?,
+        onProgress: @Sendable @escaping (String) -> Bool
+    ) async throws -> any LiveTranscriptionSession {
+        counts.withLock { $0.sessions += 1 }
+        return DroppingSession()
+    }
+
+    private actor DroppingSession: LiveTranscriptionSession {
+        func appendAudio(samples: [Float]) async throws {
+            throw PluginTranscriptionError.networkError("Socket is not connected")
+        }
+
+        func finish() async throws -> PluginTranscriptionResult {
+            PluginTranscriptionResult(text: "", detectedLanguage: nil)
+        }
+
+        func cancel() async {}
     }
 }
 

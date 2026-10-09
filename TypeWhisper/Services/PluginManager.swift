@@ -174,8 +174,14 @@ struct LoadedPlugin: Identifiable {
     var id: String { manifest.id }
 
     var isBundled: Bool {
+        #if APPSTORE
+        // App Store plugins ship inside the app but are installed and
+        // uninstalled like downloaded plugins (see AppStorePluginCatalog).
+        return false
+        #else
         guard let builtInURL = Bundle.main.builtInPlugInsURL else { return false }
         return sourceURL.path.hasPrefix(builtInURL.path)
+        #endif
     }
 
     var isRuntimeLoaded: Bool {
@@ -300,6 +306,8 @@ final class PluginManager: ObservableObject {
     private var ruleNamesProvider: @MainActor () -> [String] = { [] }
     private var workflowProvider: @MainActor () -> [PluginWorkflowInfo] = { [] }
     private var deletingModelPluginIds = Set<String>()
+    /// Uninstalled bundles whose code is still mapped into this process.
+    private var bundlesRemovedAfterRelaunch = Set<URL>()
     private var registryNotificationBatchDepth = 0
     private var registryChangedDuringBatch = false
 
@@ -416,6 +424,12 @@ final class PluginManager: ObservableObject {
                 }
                 return actions
             }
+    }
+
+    var speakerDiarizationProviders: [any SpeakerDiarizationProviderPlugin] {
+        loadedPlugins
+            .filter { $0.isEnabled }
+            .compactMap { $0.instance as? any SpeakerDiarizationProviderPlugin }
     }
 
     var memoryStoragePlugins: [MemoryStoragePlugin] {
@@ -585,17 +599,18 @@ final class PluginManager: ObservableObject {
     }
 
     private func loadAllPluginBundles() {
-        logger.info("Scanning plugins directory: \(self.pluginsDirectory.path)")
         incompatibleExternalBundles = [:]
 
         let fm = FileManager.default
+        #if !APPSTORE
+        logger.info("Scanning plugins directory: \(self.pluginsDirectory.path)")
         guard let contents = try? fm.contentsOfDirectory(at: pluginsDirectory, includingPropertiesForKeys: nil) else {
             logger.info("No plugins directory or empty")
             return
         }
 
         let bundles = sortedPluginBundleURLs(
-            contents.filter { $0.pathExtension == "bundle" },
+            contents.filter { $0.pathExtension == "bundle" && !isPendingRemoval($0) },
             isBundledSource: false
         )
         logger.info("Found \(bundles.count) plugin bundle(s)")
@@ -607,12 +622,20 @@ final class PluginManager: ObservableObject {
                 logger.error("Failed to load plugin at \(bundleURL.lastPathComponent): \(error.localizedDescription)")
             }
         }
+        #endif
 
         // Built-in plugins from app bundle
         if let builtInURL = Bundle.main.builtInPlugInsURL,
            let builtIn = try? fm.contentsOfDirectory(at: builtInURL, includingPropertiesForKeys: nil) {
+            #if APPSTORE
+            let candidateBundles = builtIn.filter {
+                $0.pathExtension == "bundle" && AppStorePluginCatalog.shouldLoadBundledPlugin(at: $0)
+            }
+            #else
+            let candidateBundles = builtIn.filter { $0.pathExtension == "bundle" }
+            #endif
             let builtInBundles = sortedPluginBundleURLs(
-                builtIn.filter { $0.pathExtension == "bundle" },
+                candidateBundles,
                 isBundledSource: true
             )
             logger.info("Found \(builtInBundles.count) built-in plugin bundle(s)")
@@ -904,6 +927,11 @@ final class PluginManager: ObservableObject {
     /// predicate is read by plugins from arbitrary contexts, so the builder must
     /// touch no actor-isolated state. The compiler enforces that here, which is why
     /// the closure captures a plain `Set` rather than the manager or the plugin.
+    /// The engine dictation uses while the saved one is unavailable (#1533). It
+    /// lives in memory only, so the saved choice stays intact, and the matcher
+    /// treats it as the selected engine until the saved one is usable again.
+    nonisolated static let temporaryFallbackEngine = OSAllocatedUnfairLock<String?>(initialState: nil)
+
     nonisolated static func selectionMatcher(
         forEnginesExposedBy exposed: Set<String>,
         defaults: @autoclosure @escaping @Sendable () -> UserDefaults = .standard
@@ -923,7 +951,8 @@ final class PluginManager: ObservableObject {
             // is missing or no longer usable, and a selection written then cannot
             // cancel a restore task that activation has already spawned. Permitting
             // during that window is what let an unselected engine's model load.
-            guard let selected = defaults().string(forKey: UserDefaultsKeys.selectedEngine),
+            guard let selected = temporaryFallbackEngine.withLock({ $0 })
+                    ?? defaults().string(forKey: UserDefaultsKeys.selectedEngine),
                   !selected.isEmpty
             else { return false }
             return exposed.contains(selected)
@@ -1073,19 +1102,75 @@ final class PluginManager: ObservableObject {
     /// Removes a plugin from the active runtime registry without unmapping its executable code.
     /// SwiftUI and AppKit may retain plugin-defined view metadata beyond the visible window's
     /// lifetime, so calling `Bundle.unload()` while the app is running is not safe.
-    func unloadPlugin(_ pluginId: String) {
+    /// Engine ids of plugins unloaded for an update, kept until the update is
+    /// gone or replaced, because the placeholder that stands in exposes none.
+    private var providerIdsAwaitingRelaunch: [String: Set<String>] = [:]
+
+    /// - Parameter keepsSavedEngine: Pass `true` when the plugin comes straight
+    ///   back, as during an update. The saved dictation engine then stays, and
+    ///   `restoreProviderSelection()` bridges the gap with a temporary fallback
+    ///   (#1533). Disabling and uninstalling replace it, as the user asked for.
+    func unloadPlugin(_ pluginId: String, keepsSavedEngine: Bool = false) {
         guard let index = loadedPlugins.firstIndex(where: { $0.manifest.id == pluginId }) else { return }
         let plugin = loadedPlugins[index]
-        let disabledProviderIds = transcriptionProviderIds(exposedBy: plugin.instance)
+        var disabledProviderIds = transcriptionProviderIds(exposedBy: plugin.instance)
+        // An update can leave a restart-required placeholder that exposes no
+        // engines; uninstalling it must still replace the engines it stands for.
+        if disabledProviderIds.isEmpty {
+            disabledProviderIds = providerIdsAwaitingRelaunch[pluginId] ?? []
+        }
 
         PluginSettingsWindowManager.shared.closeWindow(for: pluginId)
-        selectFallbackTranscriptionProviderIfNeeded(disabling: disabledProviderIds)
+        if keepsSavedEngine {
+            if !disabledProviderIds.isEmpty {
+                providerIdsAwaitingRelaunch[pluginId] = disabledProviderIds
+            }
+        } else {
+            providerIdsAwaitingRelaunch[pluginId] = nil
+            selectFallbackTranscriptionProviderIfNeeded(disabling: disabledProviderIds)
+        }
 
         if plugin.isEnabled && plugin.isRuntimeLoaded {
             plugin.instance.deactivate()
         }
         loadedPlugins.remove(at: index)
         logger.info("Removed plugin from runtime registry: \(pluginId)")
+    }
+
+    /// Removes the files of an uninstalled bundle, or defers that to the next launch when
+    /// the bundle's code already ran in this process. Plugin work can outlive `deactivate()`
+    /// and still read bundle resources (MLX looks up its Metal library lazily), and missing
+    /// files then abort the app.
+    func removeUninstalledBundle(at bundleURL: URL, codeIsLoaded: Bool) {
+        let fm = FileManager.default
+        guard codeIsLoaded else {
+            logger.info("Removing installed plugin bundle at \(bundleURL.path, privacy: .public)")
+            try? fm.removeItem(at: bundleURL)
+            return
+        }
+
+        bundlesRemovedAfterRelaunch.insert(bundleURL.standardizedFileURL)
+        let markerURL = bundleURL.appendingPathComponent(Self.pendingRemovalMarkerName)
+        if fm.createFile(atPath: markerURL.path, contents: nil) {
+            logger.info("Deferring removal of loaded plugin bundle until relaunch: \(bundleURL.path, privacy: .public)")
+        } else {
+            // Keeping the files is safer than deleting them under running code; the
+            // bundle then loads again on the next launch.
+            logger.error("Failed to mark loaded plugin bundle for removal, keeping it: \(bundleURL.path, privacy: .public)")
+        }
+    }
+
+    static let pendingRemovalMarkerName = ".typewhisper-pending-removal"
+
+    /// Deletes bundles marked by a previous session and skips those marked in this one.
+    private func isPendingRemoval(_ bundleURL: URL) -> Bool {
+        let markerURL = bundleURL.appendingPathComponent(Self.pendingRemovalMarkerName)
+        guard FileManager.default.fileExists(atPath: markerURL.path) else { return false }
+        guard !bundlesRemovedAfterRelaunch.contains(bundleURL.standardizedFileURL) else { return true }
+
+        logger.info("Removing plugin bundle uninstalled in a previous session: \(bundleURL.path, privacy: .public)")
+        try? FileManager.default.removeItem(at: bundleURL)
+        return true
     }
 
     func bundleURL(for pluginId: String) -> URL? {

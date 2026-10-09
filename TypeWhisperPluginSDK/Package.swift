@@ -204,6 +204,18 @@ let package = Package(
             ]
         ),
         .target(
+            name: "SpeakerDiarizationPlugin",
+            dependencies: [
+                "TypeWhisperPluginSDK",
+                .product(name: "FluidAudio", package: "FluidAudio"),
+            ],
+            path: "Plugins/SpeakerDiarizationPlugin",
+            exclude: ["Tests"],
+            resources: [
+                .process("manifest.json"),
+            ]
+        ),
+        .target(
             name: "CohereLocalPlugin",
             dependencies: [
                 "TypeWhisperPluginSDK",
@@ -416,6 +428,16 @@ let package = Package(
             ]
         ),
         .target(
+            name: "ScriptPlugin",
+            dependencies: ["TypeWhisperPluginSDK"],
+            path: "Plugins/ScriptPlugin",
+            exclude: ["Tests"],
+            resources: [
+                .process("Localizable.xcstrings"),
+                .process("manifest.json"),
+            ]
+        ),
+        .target(
             name: "WebhookPlugin",
             dependencies: ["TypeWhisperPluginSDK"],
             path: "Plugins/WebhookPlugin",
@@ -584,6 +606,15 @@ let package = Package(
             path: "Plugins/ParakeetPlugin/Tests"
         ),
         .testTarget(
+            name: "SpeakerDiarizationPluginTests",
+            dependencies: [
+                "TypeWhisperPluginSDK",
+                "TypeWhisperPluginSDKTesting",
+                "SpeakerDiarizationPlugin",
+            ],
+            path: "Plugins/SpeakerDiarizationPlugin/Tests"
+        ),
+        .testTarget(
             name: "CohereLocalPluginTests",
             dependencies: [
                 "TypeWhisperPluginSDK",
@@ -731,6 +762,7 @@ let package = Package(
             name: "Reson8PluginTests",
             dependencies: [
                 "TypeWhisperPluginSDK",
+                "TypeWhisperPluginSDKTesting",
                 "Reson8Plugin",
             ],
             path: "Plugins/Reson8Plugin/Tests"
@@ -770,6 +802,11 @@ let package = Package(
                 "CartesiaPlugin",
             ],
             path: "Plugins/CartesiaPlugin/Tests"
+        ),
+        .testTarget(
+            name: "ScriptPluginTests",
+            dependencies: ["TypeWhisperPluginSDK", "TypeWhisperPluginSDKTesting", "ScriptPlugin"],
+            path: "Plugins/ScriptPlugin/Tests"
         ),
         .testTarget(
             name: "WebhookPluginTests",

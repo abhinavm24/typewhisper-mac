@@ -71,6 +71,56 @@ private func recorderAudioHasAudibleTail(
     return false
 }
 
+// File-system scans run away from the main actor. The caller validates a generation
+// afterwards, discarding reads that overlapped a transcript save or deletion.
+private func readRecorderTranscriptCompletions(
+    from directory: URL, since: Date?
+) throws -> [RecorderTranscriptReadyPayload] {
+    let files: [URL]
+    do {
+        files = try FileManager.default.contentsOfDirectory(
+            at: directory, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        )
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+        return []
+    }
+    return try files.filter { $0.lastPathComponent.hasSuffix(".transcript-ready.json") }
+        .compactMap { receiptURL -> RecorderTranscriptReadyPayload? in
+            let saved = try JSONDecoder().decode(
+                RecorderTranscriptReadyPayload.self, from: Data(contentsOf: receiptURL)
+            )
+            if let since, saved.completedAt < since { return nil }
+            // Derive current paths from the receipt rather than retaining obsolete absolute paths
+            // when a user moves the recordings folder together with its sidecars.
+            let audioURL = receiptURL.deletingPathExtension().deletingPathExtension().resolvingSymlinksInPath()
+            let txtURL = audioURL.deletingPathExtension().appendingPathExtension("txt")
+            guard try isRegularRecorderAutomationFile(audioURL), try isRegularRecorderAutomationFile(txtURL) else { return nil }
+            let markdownURL = audioURL.deletingPathExtension().appendingPathExtension("transcript.md")
+            let hasMarkdown = try saved.markdownFilePath != nil && isRegularRecorderAutomationFile(markdownURL)
+            return RecorderTranscriptReadyPayload(
+                recordingID: saved.recordingID,
+                completionID: saved.completionID,
+                completedAt: saved.completedAt,
+                text: saved.text,
+                audioFilePath: audioURL.path,
+                transcriptFilePath: txtURL.path,
+                markdownFilePath: hasMarkdown ? markdownURL.path : nil
+            )
+        }
+        .sorted {
+            if $0.completedAt == $1.completedAt { return $0.completionID.uuidString < $1.completionID.uuidString }
+            return $0.completedAt < $1.completedAt
+        }
+}
+
+private func isRegularRecorderAutomationFile(_ url: URL) throws -> Bool {
+    do {
+        return try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile == true
+    } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+        return false
+    }
+}
+
 @MainActor
 final class AudioRecorderViewModel: ObservableObject {
     typealias AudioSamplesLoader = @MainActor (URL) async throws -> [Float]
@@ -78,6 +128,7 @@ final class AudioRecorderViewModel: ObservableObject {
         URL,
         [String: RecordingTranscriptionFailure]
     ) -> [RecordingItem]
+    typealias RecorderCompletionsLoader = @Sendable (URL, Date?) throws -> [RecorderTranscriptReadyPayload]
 
     nonisolated(unsafe) static var _shared: AudioRecorderViewModel?
     static var shared: AudioRecorderViewModel {
@@ -139,7 +190,12 @@ final class AudioRecorderViewModel: ObservableObject {
         let prompt: String?
         let dictionaryTermHints: [PluginDictionaryTermHint]
         let liveSessionResult: TranscriptionResult?
+        /// The live session lost audio or could not finalize, so its preview is not
+        /// a usable transcript.
+        let liveSessionFailed: Bool
         let calendarEvent: CalendarMeetingTranscriptMetadata?
+        /// When the microphone carried the user's own speech, for speaker detection.
+        var ownSpeech: [ClosedRange<TimeInterval>] = []
     }
 
     struct RecordingTranscriptionFailure: Codable, Equatable, Sendable {
@@ -233,6 +289,12 @@ final class AudioRecorderViewModel: ObservableObject {
             recorderService.micDuckingMode = micDuckingMode
         }
     }
+    /// Saves each transcribed recording to History and detects its speakers (Premium).
+    @Published var detectSpeakers: Bool {
+        didSet { defaults.set(detectSpeakers, forKey: UserDefaultsKeys.recorderDetectSpeakers) }
+    }
+    var speakerRecordIntake: SpeakerRecordIntake?
+
     @Published var trackMode: AudioRecorderService.TrackMode {
         didSet {
             defaults.set(trackMode.rawValue, forKey: UserDefaultsKeys.recorderTrackMode)
@@ -321,6 +383,7 @@ final class AudioRecorderViewModel: ObservableObject {
     private let dictionaryService: DictionaryService
     private let audioSamplesLoader: AudioSamplesLoader
     private let recordingsLoader: RecordingsLoader
+    private let recorderCompletionsLoader: RecorderCompletionsLoader
     private let defaults: UserDefaults
     private let streamingHandler: StreamingHandler
     private let livePreviewStartObserver: (() -> Void)?
@@ -345,6 +408,7 @@ final class AudioRecorderViewModel: ObservableObject {
         defaults: UserDefaults = .standard,
         audioSamplesLoader: AudioSamplesLoader? = nil,
         recordingsLoader: RecordingsLoader? = nil,
+        recorderCompletionsLoader: RecorderCompletionsLoader? = nil,
         livePreviewStartObserver: (() -> Void)? = nil
     ) {
         self.recorderService = recorderService
@@ -357,6 +421,7 @@ final class AudioRecorderViewModel: ObservableObject {
         self.recordingsLoader = recordingsLoader ?? { directory, transientFailures in
             Self.readRecordings(from: directory, transientFailures: transientFailures)
         }
+        self.recorderCompletionsLoader = recorderCompletionsLoader ?? readRecorderTranscriptCompletions
         self.defaults = defaults
         self.livePreviewStartObserver = livePreviewStartObserver
         self.streamingHandler = StreamingHandler(
@@ -382,6 +447,7 @@ final class AudioRecorderViewModel: ObservableObject {
             self.micEnabled = defaults.bool(forKey: UserDefaultsKeys.recorderMicEnabled)
         }
         self.systemAudioEnabled = defaults.bool(forKey: UserDefaultsKeys.recorderSystemAudioEnabled)
+        self.detectSpeakers = defaults.bool(forKey: UserDefaultsKeys.recorderDetectSpeakers)
 
         if let formatString = defaults.string(forKey: UserDefaultsKeys.recorderOutputFormat),
            let format = AudioRecorderService.OutputFormat(rawValue: formatString) {
@@ -678,11 +744,13 @@ final class AudioRecorderViewModel: ObservableObject {
             let stoppedRecording = await recorderService.stopCapture(
                 includeTranscriptionSamples: shouldTranscribe
             )
-            async let liveSessionResultTask = streamingHandler.finish(
+            async let liveSessionFinishTask = streamingHandler.finish(
                 finalSamples: stoppedRecording.transcriptionSamples
             )
             async let finalizedURLTask = recorderService.finalizeRecording(stoppedRecording)
-            let (liveSessionResult, url) = await (liveSessionResultTask, finalizedURLTask)
+            let (liveSessionFinish, url) = await (liveSessionFinishTask, finalizedURLTask)
+            let liveSessionResult = liveSessionFinish.result
+            let liveSessionFailed = if case .failed = liveSessionFinish { true } else { false }
 
             if let url, let calendarEvent {
                 do {
@@ -722,7 +790,9 @@ final class AudioRecorderViewModel: ObservableObject {
                     prompt: dictionaryPrompt,
                     dictionaryTermHints: dictionaryTermHints,
                     liveSessionResult: liveSessionResult,
-                    calendarEvent: calendarEvent
+                    liveSessionFailed: liveSessionFailed,
+                    calendarEvent: calendarEvent,
+                    ownSpeech: stoppedRecording.ownSpeech
                 )
                 if let apiSessionID {
                     markRecorderAPISessionFinalizing(id: apiSessionID, outputURL: url)
@@ -743,8 +813,14 @@ final class AudioRecorderViewModel: ObservableObject {
                 finalTranscriptionOutcome = .skipped
             }
 
-            // Emit final transcript to LiveTranscriptPlugin
-            if livePreviewEnabled && !partialText.isEmpty {
+            // Emit final transcript to LiveTranscriptPlugin. A failed live session's preview
+            // stopped early, so it is only final once a saved transcript replaced it.
+            let partialTextIsFinal = if case .transcriptSaved = finalTranscriptionOutcome {
+                true
+            } else {
+                !liveSessionFailed
+            }
+            if livePreviewEnabled && partialTextIsFinal && !partialText.isEmpty {
                 EventBus.shared.emit(.partialTranscriptionUpdate(PartialTranscriptionPayload(
                     text: partialText, isFinal: true, elapsedSeconds: recordingDuration
                 )))
@@ -832,6 +908,24 @@ final class AudioRecorderViewModel: ObservableObject {
         recorderAPISessions[id]
     }
 
+    private var recorderTranscriptGeneration = 0
+
+    /// Reads durable completion receipts, including manual and calendar recordings.
+    func apiRecorderRecordings(since: Date? = nil) async throws -> [RecorderTranscriptReadyPayload] {
+        let directory = recorderService.recordingsDirectory
+        let loader = recorderCompletionsLoader
+        for _ in 0..<3 {
+            let generation = recorderTranscriptGeneration
+            let result = await Task.detached(priority: .utility) {
+                Result { try loader(directory, since) }
+            }.value
+            try Task.checkCancellation()
+            guard generation == recorderTranscriptGeneration else { continue }
+            return try result.get()
+        }
+        throw CocoaError(.fileReadUnknown)
+    }
+
     // MARK: - Calendar Meeting Automation
 
     func startCalendarMeetingRecording(
@@ -911,11 +1005,14 @@ final class AudioRecorderViewModel: ObservableObject {
 
     func deleteRecording(_ item: RecordingItem) {
         guard !isRetranscribing(item) else { return }
+        defer { recorderTranscriptGeneration &+= 1 }
 
         let sidecarURLs = [
             transcriptURL(for: item.url),
             transcriptMarkdownURL(for: item.url),
             transcriptDocumentURL(for: item.url),
+            transcriptReadyURL(for: item.url),
+            recordingIdentityURL(for: item.url),
             transcriptionFailureURL(for: item.url)
         ]
 
@@ -1017,10 +1114,13 @@ final class AudioRecorderViewModel: ObservableObject {
                 prompt: self.dictionaryService.getTermsForPrompt(providerId: providerId),
                 dictionaryTermHints: self.dictionaryService.getTermHints(providerId: providerId),
                 liveSessionResult: nil,
+                liveSessionFailed: false,
                 calendarEvent: item.calendarEvent
             )
 
-            _ = await self.runRetranscription(request)
+            // A recording transcribed before may already have its speaker record.
+            let hadTranscript = FileManager.default.fileExists(atPath: self.transcriptURL(for: url).path)
+            _ = await self.runRetranscription(request, addsSpeakerRecord: !hadTranscript)
         }
     }
 
@@ -1188,10 +1288,13 @@ final class AudioRecorderViewModel: ObservableObject {
         isTranscribing = true
         defer { isTranscribing = false }
 
+        // A failed live session's preview stopped at the failure, so it never stands in
+        // for the transcript.
+        let previewCanBeTranscript = !request.liveSessionFailed
         let buffer = request.buffer
         guard buffer.count > 8000 else { // At least 0.5s of audio
             // Use streaming result as final if buffer too short
-            if !partialText.isEmpty {
+            if previewCanBeTranscript, !partialText.isEmpty {
                 return saveTranscriptOutcome(partialText, for: request.outputURL, request: request)
             } else if let liveSessionResult = request.liveSessionResult {
                 let text = liveSessionResult.text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1215,8 +1318,11 @@ final class AudioRecorderViewModel: ObservableObject {
             let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
             if !text.isEmpty {
                 partialText = text
-                return saveTranscriptOutcome(text, for: request.outputURL, request: request)
-            } else if !partialText.isEmpty {
+                // The transcript is saved first; adding the speaker record can take seconds.
+                let outcome = saveTranscriptOutcome(text, for: request.outputURL, request: request)
+                await addSpeakerRecordIfWanted(result, request: request)
+                return outcome
+            } else if previewCanBeTranscript, !partialText.isEmpty {
                 return saveTranscriptOutcome(partialText, for: request.outputURL, request: request)
             } else {
                 let failure = makeTranscriptionFailure(
@@ -1233,7 +1339,7 @@ final class AudioRecorderViewModel: ObservableObject {
         } catch {
             logger.error("Final transcription failed: \(error.localizedDescription)")
             // Fall back to streaming result
-            if !partialText.isEmpty {
+            if previewCanBeTranscript, !partialText.isEmpty {
                 return saveTranscriptOutcome(partialText, for: request.outputURL, request: request)
             }
             let failure = makeTranscriptionFailure(
@@ -1247,7 +1353,10 @@ final class AudioRecorderViewModel: ObservableObject {
         }
     }
 
-    private func runRetranscription(_ request: FinalTranscriptionRequest) async -> FinalTranscriptionOutcome {
+    private func runRetranscription(
+        _ request: FinalTranscriptionRequest,
+        addsSpeakerRecord: Bool
+    ) async -> FinalTranscriptionOutcome {
         let effectiveTask = resolvedTask(for: request)
 
         do {
@@ -1264,7 +1373,11 @@ final class AudioRecorderViewModel: ObservableObject {
                 return .failed(recordedFailure)
             }
 
-            return saveTranscriptOutcome(text, for: request.outputURL, request: request)
+            let outcome = saveTranscriptOutcome(text, for: request.outputURL, request: request)
+            if addsSpeakerRecord {
+                await addSpeakerRecordIfWanted(result, request: request)
+            }
+            return outcome
         } catch is CancellationError {
             return .skipped
         } catch {
@@ -1281,6 +1394,23 @@ final class AudioRecorderViewModel: ObservableObject {
             }
             return .skipped
         }
+    }
+
+    /// Calendar-meeting recordings detect speakers unless that was turned off;
+    /// other recordings follow the Recorder's switch. The intake checks Premium.
+    private func addSpeakerRecordIfWanted(_ result: TranscriptionResult, request: FinalTranscriptionRequest) async {
+        let wanted = request.calendarEvent != nil
+            ? defaults.object(forKey: UserDefaultsKeys.calendarMeetingDetectSpeakers) as? Bool ?? true
+            : detectSpeakers
+        guard wanted, let speakerRecordIntake else { return }
+        _ = await speakerRecordIntake(SpeakerRecordingInput(
+            result: result,
+            samples: request.buffer,
+            title: request.outputURL.deletingPathExtension().lastPathComponent,
+            source: .recorder,
+            modelUsed: request.modelOverrideId,
+            ownSpeech: request.ownSpeech
+        ))
     }
 
     private func transcribeFinalRecording(
@@ -1445,6 +1575,7 @@ final class AudioRecorderViewModel: ObservableObject {
             prompt: nil,
             dictionaryTermHints: [],
             liveSessionResult: nil,
+            liveSessionFailed: false,
             calendarEvent: nil
         )
         let failure = makeTranscriptionFailure(
@@ -1466,21 +1597,74 @@ final class AudioRecorderViewModel: ObservableObject {
         _ text: String,
         for audioURL: URL,
         calendarEvent: CalendarMeetingTranscriptMetadata?
-    ) throws {
+    ) throws -> RecorderTranscriptReadyPayload {
+        defer { recorderTranscriptGeneration &+= 1 }
+        let audioURL = audioURL.resolvingSymlinksInPath()
         let txtURL = transcriptURL(for: audioURL)
+        guard try isRegularRecorderAutomationFile(audioURL) else {
+            throw CocoaError(.fileReadNoSuchFile, userInfo: [NSFilePathErrorKey: audioURL.path])
+        }
+        let receiptURL = transcriptReadyURL(for: audioURL)
+        let identity = try recordingIdentity(for: audioURL)
+        let payload = RecorderTranscriptReadyPayload(
+            recordingID: identity.recordingID,
+            text: text,
+            audioFilePath: audioURL.path,
+            transcriptFilePath: txtURL.path,
+            markdownFilePath: calendarEvent == nil ? nil : transcriptMarkdownURL(for: audioURL).path
+        )
+        var writes = [RecordingFileWrite(url: txtURL, data: Data(text.utf8))]
         if let calendarEvent {
-            let documentWrites = try transcriptDocumentWrites(
+            writes += try transcriptDocumentWrites(
                 text: text,
                 calendarEvent: calendarEvent,
                 for: audioURL
             )
-            try writeRecordingFilesTransactionally([
-                RecordingFileWrite(url: txtURL, data: Data(text.utf8))
-            ] + documentWrites)
-        } else {
-            try text.write(to: txtURL, atomically: true, encoding: .utf8)
         }
+        writes.append(RecordingFileWrite(url: recordingIdentityURL(for: audioURL), data: try JSONEncoder().encode(identity)))
+        writes.append(RecordingFileWrite(url: receiptURL, data: try JSONEncoder().encode(payload)))
+        try writeRecordingFilesTransactionally(writes)
         clearTranscriptionFailure(for: audioURL)
+        return payload
+    }
+
+    private func transcriptReadyURL(for audioURL: URL) -> URL {
+        audioURL.appendingPathExtension("transcript-ready.json")
+    }
+
+    private struct RecordingIdentity: Codable {
+        let recordingID: UUID
+
+        private enum CodingKeys: String, CodingKey {
+            case recordingID = "recording_id"
+        }
+    }
+
+    private func recordingIdentityURL(for audioURL: URL) -> URL {
+        audioURL.appendingPathExtension("recording-id.json")
+    }
+
+    private func recordingIdentity(for audioURL: URL) throws -> RecordingIdentity {
+        var foundExistingIdentity = false
+        // Either copy can recover the stable ID after the other is damaged. Reading only
+        // the identity also permits repairing receipts with invalid completion fields.
+        for url in [recordingIdentityURL(for: audioURL), transcriptReadyURL(for: audioURL)] {
+            let data: Data
+            do {
+                data = try Data(contentsOf: url)
+            } catch let error as CocoaError where error.code == .fileReadNoSuchFile || error.code == .fileNoSuchFile {
+                continue
+            }
+            foundExistingIdentity = true
+            if let identity = try? JSONDecoder().decode(RecordingIdentity.self, from: data) {
+                return identity
+            }
+        }
+        // Losing both copies must not silently split one recording into a new identity.
+        guard !foundExistingIdentity else {
+            throw CocoaError(.fileReadCorruptFile, userInfo: [NSFilePathErrorKey: audioURL.path])
+        }
+        return RecordingIdentity(recordingID: UUID())
     }
 
     private func transcriptDocumentURL(for audioURL: URL) -> URL {
@@ -1616,11 +1800,12 @@ final class AudioRecorderViewModel: ObservableObject {
         request: FinalTranscriptionRequest
     ) -> FinalTranscriptionOutcome {
         do {
-            try saveTranscript(
+            let payload = try saveTranscript(
                 text,
                 for: audioURL,
                 calendarEvent: request.calendarEvent
             )
+            EventBus.shared.emit(.recorderTranscriptReady(payload))
             return .transcriptSaved
         } catch {
             logger.error("Failed to save transcript: \(error.localizedDescription)")

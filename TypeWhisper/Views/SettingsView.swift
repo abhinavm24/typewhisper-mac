@@ -3,7 +3,7 @@ import AppKit
 import TypeWhisperPluginSDK
 
 enum SettingsTab: Hashable {
-    case home, general, appearance, dictation, transform, hotkeys, recorder
+    case home, general, appearance, dictation, transform, hotkeys, recorder, speakers
     case dictationRecovery, fileTranscription, history, statistics, dictionary, snippets, workflows, profiles, prompts, premium, integrations, advanced, license, about
     case plugin(pluginId: String, itemId: String)
     case installedPlugin(pluginId: String)
@@ -53,6 +53,7 @@ struct SettingsView: View {
         case "transform": return .transform
         case "hotkeys": return .hotkeys
         case "file-transcription": return .fileTranscription
+        case "speakers": return .speakers
         case "recorder": return .recorder
         case "history": return .history
         case "statistics": return .statistics
@@ -90,6 +91,7 @@ struct SettingsView: View {
                 badge: nil
             ),
             SettingsDestination(tab: .fileTranscription, title: String(localized: "File Transcription"), systemImage: "doc.text", badge: nil),
+            SettingsDestination(tab: .speakers, title: String(localized: "speakers.page.title"), systemImage: "person.wave.2", badge: nil),
             SettingsDestination(tab: .history, title: String(localized: "History & Sync"), systemImage: "clock.arrow.circlepath", badge: nil),
             SettingsDestination(
                 tab: .statistics,
@@ -134,6 +136,8 @@ struct SettingsView: View {
         }
 
         let installedPluginDestinations = pluginManager.loadedPlugins
+            // Speaker detection is managed on the Speakers page, not as a plugin.
+            .filter { $0.id != SpeakerTranscriptCoordinator.bundledPluginID }
             .sorted { lhs, rhs in
                 // Disabled plugins sink below the ones in use.
                 if lhs.isEnabled != rhs.isEnabled { return lhs.isEnabled }
@@ -306,6 +310,8 @@ struct SettingsView: View {
             DictationRecoveryView()
         case .fileTranscription:
             FileTranscriptionView()
+        case .speakers:
+            SpeakersView()
         case .history:
             HistorySettingsView()
         case .statistics:
@@ -327,7 +333,11 @@ struct SettingsView: View {
         case .advanced:
             AdvancedSettingsView()
         case .license:
+            #if APPSTORE
+            PremiumSettingsView()
+            #else
             LicenseSettingsView()
+            #endif
         case .about:
             AboutSettingsView()
         case .installedPlugin(let pluginId):
@@ -670,7 +680,8 @@ private func settingsDestinationSections(_ destinations: [SettingsDestination]) 
     coreDestinations.append(contentsOf: [
         settingsDestination(destinations, .hotkeys),
         settingsDestination(destinations, .fileTranscription),
-        settingsDestination(destinations, .recorder)
+        settingsDestination(destinations, .recorder),
+        settingsDestination(destinations, .speakers)
     ])
 
     let workspaceDestinations = [
@@ -691,6 +702,20 @@ private func settingsDestinationSections(_ destinations: [SettingsDestination]) 
 
     let integrationDestinations = [settingsDestination(destinations, .integrations)] + pluginDestinations
 
+    #if APPSTORE
+    // Premium is bought on the Premium page, so there is no License page.
+    let systemDestinations = [
+        settingsDestination(destinations, .advanced),
+        settingsDestination(destinations, .about)
+    ]
+    #else
+    let systemDestinations = [
+        settingsDestination(destinations, .advanced),
+        settingsDestination(destinations, .license),
+        settingsDestination(destinations, .about)
+    ]
+    #endif
+
     return [
         SettingsDestinationSection(
             id: "home",
@@ -710,11 +735,7 @@ private func settingsDestinationSections(_ destinations: [SettingsDestination]) 
         ),
         SettingsDestinationSection(
             id: "system",
-            destinations: [
-                settingsDestination(destinations, .advanced),
-                settingsDestination(destinations, .license),
-                settingsDestination(destinations, .about)
-            ]
+            destinations: systemDestinations
         )
     ]
 }
@@ -884,10 +905,10 @@ struct RecordingSettingsView: View {
     @ObservedObject private var audioDevice = ServiceContainer.shared.audioDeviceService
     @ObservedObject private var pluginManager = PluginManager.shared
     @ObservedObject private var modelManager = ServiceContainer.shared.modelManagerService
-    @State private var selectedProvider: String?
     @State private var customSounds: [String] = SoundChoice.installedCustomSounds()
     @State private var draggedInputDevicePriorityItem: AudioInputDevicePriorityItem?
     @AppStorage(UserDefaultsKeys.airPodsInstantStartEnabled) private var bluetoothInstantStartEnabled = false
+    @AppStorage(UserDefaultsKeys.microphonePrerollEnabled) private var microphonePrerollEnabled = false
     @AppStorage(UserDefaultsKeys.transcriptionNumberNormalizationEnabled) private var numberNormalizationEnabled = true
     @AppStorage(UserDefaultsKeys.transcriptionNumberNormalizationMinimumValue)
     private var numberNormalizationMinimumValue = TranscriptionNormalizationService.defaultNumberNormalizationMinimumValue
@@ -895,7 +916,12 @@ struct RecordingSettingsView: View {
     private let audioRecordingService = ServiceContainer.shared.audioRecordingService
 
     private var needsPermissions: Bool {
+#if APPSTORE
         dictation.needsMicPermission || dictation.needsAccessibilityPermission
+            || dictation.needsInputMonitoringPermission
+#else
+        dictation.needsMicPermission || dictation.needsAccessibilityPermission
+#endif
     }
 
     private var usesBluetoothInput: Bool {
@@ -1122,18 +1148,20 @@ struct RecordingSettingsView: View {
                     Text(String(localized: "No transcription engines installed. Install engines via Integrations."))
                         .foregroundStyle(.secondary)
                 } else {
-                    Picker(String(localized: "Default Engine"), selection: $selectedProvider) {
+                    // Shows the engine dictation uses right now, which can be a
+                    // temporary fallback; only a choice made here is saved (#1533).
+                    Picker(String(localized: "Default Engine"), selection: Binding(
+                        get: { modelManager.selectedProviderId },
+                        set: { newValue in
+                            if let newValue { modelManager.selectProvider(newValue) }
+                        }
+                    )) {
                         Text(String(localized: "None")).tag(nil as String?)
                         Divider()
                         ForEach(engines, id: \.providerId) { engine in
                             enginePickerLabel(for: engine)
                                 .tag(engine.providerId as String?)
                                 .disabled(!modelManager.canUseForTranscription(engine))
-                        }
-                    }
-                    .onChange(of: selectedProvider) { _, newValue in
-                        if let newValue {
-                            modelManager.selectProvider(newValue)
                         }
                     }
 
@@ -1143,14 +1171,15 @@ struct RecordingSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
 
-                    if let providerId = selectedProvider,
+                    if let providerId = modelManager.selectedProviderId,
                        let engine = pluginManager.transcriptionEngine(for: providerId),
                        modelManager.canUseForTranscription(engine) {
                         let models = engine.transcriptionModels
                         if models.count > 1 {
                             Picker(String(localized: "Model"), selection: Binding(
                                 get: { engine.selectedModelId },
-                                set: { if let id = $0 { modelManager.selectModel(providerId, modelId: id) } }
+                                // Changing the model keeps the saved engine as it is.
+                                set: { if let id = $0 { modelManager.selectModel(id, of: providerId) } }
                             )) {
                                 ForEach(models, id: \.id) { model in
                                     Text(model.displayName).tag(model.id as String?)
@@ -1183,6 +1212,22 @@ struct RecordingSettingsView: View {
                     }
 
                     Text(String(localized: "Keeps the Bluetooth microphone active between dictations. Audio between dictations is discarded. This shows the orange microphone indicator, uses more battery, and keeps headset audio in call-quality mode."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Toggle(
+                        String(localized: "Start speaking right away"),
+                        isOn: $microphonePrerollEnabled
+                    )
+                    .onChange(of: microphonePrerollEnabled) { _, _ in
+                        audioRecordingService.handleMicrophonePrerollPreferenceChange()
+                    }
+
+                    Text(String(localized: "Keeps the microphone running between dictations and holds the last half second of audio in memory only, so your first words are not cut off. Nothing is saved, sent, or processed until you start dictating. The orange microphone indicator stays on while this is enabled."))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Text(String(localized: "On Macs where the built-in microphone needs voice processing, it cannot stay active between dictations. This setting has no effect there; choose another microphone to use it."))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1346,10 +1391,29 @@ struct RecordingSettingsView: View {
                         }
                     }
 
+#if APPSTORE
+                    if dictation.needsAccessibilityPermission {
+                        AppStorePermissionRow(
+                            dictation: dictation,
+                            kind: .accessibility,
+                            titleStyle: .short,
+                            labelColor: .orange
+                        )
+                    }
+
+                    if dictation.needsInputMonitoringPermission {
+                        AppStorePermissionRow(
+                            dictation: dictation,
+                            kind: .inputMonitoring,
+                            titleStyle: .short,
+                            labelColor: .orange
+                        )
+                    }
+#else
                     if dictation.needsAccessibilityPermission {
                         HStack {
                             Label(
-                                String(localized: "Accessibility"),
+                                AccessibilityPermissionPane.localizedName(),
                                 systemImage: "lock.shield"
                             )
                             .foregroundStyle(.orange)
@@ -1363,6 +1427,7 @@ struct RecordingSettingsView: View {
                             .controlSize(.small)
                         }
                     }
+#endif
                     }
                 }
             }
@@ -1373,7 +1438,6 @@ struct RecordingSettingsView: View {
         .frame(minWidth: 500, minHeight: 300)
         .onAppear {
             modelManager.restoreProviderSelection()
-            selectedProvider = modelManager.selectedProviderId
             customSounds = SoundChoice.installedCustomSounds()
         }
     }
@@ -1533,10 +1597,19 @@ struct PermissionsBanner: View {
                 }
             }
 
+#if APPSTORE
+            if dictation.needsAccessibilityPermission {
+                AppStorePermissionRow(dictation: dictation, kind: .accessibility, labelColor: .red)
+            }
+
+            if dictation.needsInputMonitoringPermission {
+                AppStorePermissionRow(dictation: dictation, kind: .inputMonitoring, labelColor: .red)
+            }
+#else
             if dictation.needsAccessibilityPermission {
                 HStack {
                     Label(
-                        String(localized: "Accessibility access required"),
+                        AccessibilityPermissionPane.accessRequiredText(),
                         systemImage: "lock.shield"
                     )
                     .foregroundStyle(.red)
@@ -1550,6 +1623,7 @@ struct PermissionsBanner: View {
                     .controlSize(.small)
                 }
             }
+#endif
         }
     }
 }
