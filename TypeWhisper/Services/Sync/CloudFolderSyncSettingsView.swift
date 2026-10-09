@@ -753,14 +753,25 @@ final class CloudFolderSyncController: ObservableObject {
     @Published var errorMessage: String?
     @Published var statusMessage: String?
 
+    private var hasPremiumAccountAccess: Bool {
+        #if APPSTORE
+        premiumAccountService.isSignedIn && AppStorePremiumService.shared?.hasPremiumAccess == true
+        #else
+        premiumAccountService.isSignedIn && premiumAccountService.hasPremiumEntitlement
+        #endif
+    }
+
     var canUseSync: Bool {
         #if APPSTORE
         // An App Store purchase also unlocks sync; the account connects the devices.
         AppConstants.isPremiumSyncSmokeTest
             || (premiumAccountService.isSignedIn && AppStorePremiumService.shared?.hasPremiumAccess == true)
         #else
-        AppConstants.isPremiumSyncSmokeTest
-            || (premiumAccountService.isSignedIn && premiumAccountService.hasPremiumEntitlement)
+        LocalFeatureAccess.canUseCloudSync(
+            mode: mode,
+            hasPremiumAccountAccess: hasPremiumAccountAccess,
+            isSmokeTest: AppConstants.isPremiumSyncSmokeTest
+        )
         #endif
     }
 
@@ -770,7 +781,11 @@ final class CloudFolderSyncController: ObservableObject {
         automaticICloudAvailable || mode == .automaticICloud
             ? PremiumSyncMode.allCases : [.off, .cloudFolder]
         #else
-        automaticICloudAvailable ? PremiumSyncMode.allCases : [.off, .cloudFolder]
+        LocalFeatureAccess.availableCloudSyncModes(
+            automaticICloudAvailable: automaticICloudAvailable,
+            hasPremiumAccountAccess: hasPremiumAccountAccess,
+            isSmokeTest: AppConstants.isPremiumSyncSmokeTest
+        )
         #endif
     }
 
@@ -894,7 +909,11 @@ final class CloudFolderSyncController: ObservableObject {
     }
 
     func setMode(_ newMode: PremiumSyncMode) async {
+        #if APPSTORE
         guard automaticICloudAvailable || newMode != .automaticICloud else { return }
+        #else
+        guard availableModes.contains(newMode) else { return }
+        #endif
         guard newMode != mode, !isSyncing else { return }
         if isConfigured, canUseSync { await syncNow() }
         guard !isSyncing else { return }
@@ -1474,6 +1493,12 @@ final class CloudFolderSyncController: ObservableObject {
     func deletePrivateSyncFolder() async {
         guard !isSyncing else { return }
         let deletedMode = mode
+        #if !APPSTORE
+        guard deletedMode != .automaticICloud || hasPremiumAccountAccess else {
+            errorMessage = CloudFolderSyncError.notEntitled.localizedDescription
+            return
+        }
+        #endif
         guard let folderURL = activeFolderURL(for: deletedMode) else { return }
         scheduledSyncTask?.cancel()
         scheduledSyncTask = nil
@@ -1677,7 +1702,9 @@ struct CloudFolderSyncSettingsView: View {
                     } label: {
                         Label(String(localized: "premium.window.sync.deleteData"), systemImage: "trash")
                     }
-                    .disabled(!controller.isConfigured || controller.isSyncing)
+                    .disabled(!controller.isConfigured
+                              || (LocalFeatureAccess.customFolderSync && !controller.canUseSync)
+                              || controller.isSyncing)
                     .accessibilityIdentifier("premium.sync.deleteData")
                 }
             }
@@ -1743,6 +1770,9 @@ struct CloudFolderSyncSettingsView: View {
     }
 
     private var statusText: String {
+        if LocalFeatureAccess.customFolderSync, controller.mode == .automaticICloud, !controller.canUseSync {
+            return String(localized: "premium.hub.status.actionRequired")
+        }
         if controller.isSyncing {
             return String(localized: "premium.window.sync.syncing")
         }
@@ -1750,6 +1780,9 @@ struct CloudFolderSyncSettingsView: View {
     }
 
     private var statusColor: Color {
+        if LocalFeatureAccess.customFolderSync, controller.mode == .automaticICloud, !controller.canUseSync {
+            return .orange
+        }
         if controller.isSyncing {
             return .blue
         }
