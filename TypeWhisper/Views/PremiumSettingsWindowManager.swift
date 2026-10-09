@@ -6,6 +6,7 @@ enum PremiumSettingsDestination: String, CaseIterable, Hashable, Sendable {
     case calendarMeeting
     case correctionLearning
     case cloudSync
+    case speakerWorkspace
 }
 
 @MainActor
@@ -31,6 +32,7 @@ struct PremiumSettingsWindowFactories {
     let calendarMeeting: Factory
     let correctionLearning: Factory
     let cloudSync: Factory
+    let speakerWorkspace: Factory
 
     func makeDefinition(
         for destination: PremiumSettingsDestination
@@ -44,6 +46,8 @@ struct PremiumSettingsWindowFactories {
             correctionLearning()
         case .cloudSync:
             cloudSync()
+        case .speakerWorkspace:
+            speakerWorkspace()
         }
     }
 
@@ -112,6 +116,24 @@ struct PremiumSettingsWindowFactories {
                             licenseService: .shared,
                             premiumAccount: ServiceContainer.shared.premiumAccountService,
                             syncController: ServiceContainer.shared.cloudFolderSyncController,
+                            onManageAccess: {
+                                PremiumSettingsWindowManager.shared.present(.access)
+                            }
+                        )
+                    )
+                )
+            },
+            speakerWorkspace: {
+                PremiumSettingsWindowDefinition(
+                    title: String(localized: "premium.window.speakers.title"),
+                    preferredSize: CGSize(width: 580, height: 520),
+                    minimumSize: CGSize(width: 520, height: 420),
+                    accessibilityIdentifier: "premium.window.speakers",
+                    content: AnyView(
+                        PremiumSpeakerSettingsWindow(
+                            licenseService: .shared,
+                            premiumAccount: ServiceContainer.shared.premiumAccountService,
+                            coordinator: ServiceContainer.shared.speakerTranscriptCoordinator,
                             onManageAccess: {
                                 PremiumSettingsWindowManager.shared.present(.access)
                             }
@@ -274,7 +296,52 @@ struct PremiumCalendarMeetingSettingsWindow: View {
             CalendarMeetingSettingsSection(controller: controllerFactory())
         } else {
             PremiumLockedDetailView(
-                message: String(localized: "premium.window.calendar.locked"),
+                message: lockedMessage,
+                onManageAccess: onManageAccess
+            )
+        }
+    }
+
+    private var lockedMessage: String {
+        #if APPSTORE
+        localizedAppText(
+            "Meeting Automation requires TypeWhisper Premium.",
+            de: "Meeting-Automation benötigt TypeWhisper Premium."
+        )
+        #else
+        String(localized: "premium.window.calendar.locked")
+        #endif
+    }
+}
+
+@MainActor
+private struct PremiumSpeakerSettingsWindow: View {
+    @ObservedObject private var license: LicenseService
+    @ObservedObject private var premiumAccount: PremiumAccountService
+    private let coordinator: SpeakerTranscriptCoordinator
+    private let onManageAccess: () -> Void
+
+    init(
+        licenseService: LicenseService,
+        premiumAccount: PremiumAccountService,
+        coordinator: SpeakerTranscriptCoordinator,
+        onManageAccess: @escaping () -> Void
+    ) {
+        self.license = licenseService
+        self.premiumAccount = premiumAccount
+        self.coordinator = coordinator
+        self.onManageAccess = onManageAccess
+    }
+
+    var body: some View {
+        if SpeakerWorkspacePremiumAccess.isGranted(
+            hasCommercialLicense: license.hasCommercialLicense,
+            hasPremiumEntitlement: premiumAccount.hasPremiumEntitlement
+        ) {
+            SpeakerDetectionSettingsSection(coordinator: coordinator)
+        } else {
+            PremiumLockedDetailView(
+                message: String(localized: "premium.window.speakers.locked"),
                 onManageAccess: onManageAccess
             )
         }
@@ -301,9 +368,7 @@ struct PremiumCloudSyncSettingsWindow: View {
     }
 
     var body: some View {
-        if premiumAccount.isSignedIn,
-           premiumAccount.hasPremiumEntitlement,
-           syncController.canUseSync {
+        if isAvailable {
             CloudFolderSyncSettingsView(controller: syncController)
         } else {
             PremiumLockedDetailView(
@@ -313,13 +378,34 @@ struct PremiumCloudSyncSettingsWindow: View {
         }
     }
 
+    private var isAvailable: Bool {
+        #if APPSTORE
+        syncController.canUseSync
+        #else
+        premiumAccount.isSignedIn && premiumAccount.hasPremiumEntitlement && syncController.canUseSync
+        #endif
+    }
+
     private var lockedMessage: String {
+        #if APPSTORE
+        if license.hasCommercialLicense, !premiumAccount.isSignedIn {
+            return localizedAppText(
+                "Sign in with Apple to sync your dictionary and snippets across your devices.",
+                de: "Melde dich mit Apple an, um Wörterbuch und Snippets auf deinen Geräten zu synchronisieren."
+            )
+        }
+        return localizedAppText(
+            "Cloud sync requires TypeWhisper Premium and sign-in with Apple.",
+            de: "Cloud-Sync benötigt TypeWhisper Premium und eine Anmeldung mit Apple."
+        )
+        #else
         if license.hasCommercialLicense,
            premiumAccount.isSignedIn,
            !premiumAccount.hasPremiumEntitlement {
             return String(localized: "premium.window.sync.linkRequired")
         }
         return String(localized: "premium.window.sync.locked")
+        #endif
     }
 }
 

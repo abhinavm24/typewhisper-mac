@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 import TypeWhisperPluginSDK
 @testable import TypeWhisper
@@ -72,6 +73,210 @@ private final class UnsupportedDictionaryEnginePlugin: NSObject, TranscriptionEn
 
     func transcribe(audio: AudioData, language: String?, translate: Bool, prompt: String?) async throws -> PluginTranscriptionResult {
         PluginTranscriptionResult(text: "ok", detectedLanguage: language)
+    }
+}
+
+private struct SettingEnablingTestError: LocalizedError {
+    var errorDescription: String? { "Download failed" }
+}
+
+private final class SettingEnablingDictionaryEnginePlugin: NSObject, TranscriptionEnginePlugin, DictionaryTermsSettingEnabling, @unchecked Sendable {
+    static let pluginId = "com.typewhisper.tests.setting-enabling-dictionary-engine"
+    static let pluginName = "Setting Enabling Dictionary Engine"
+    var isSettingEnabled = false
+    var failsToEnable = false
+    private(set) var enableCallCount = 0
+
+    required override init() {}
+
+    func activate(host: HostServices) {}
+    func deactivate() {}
+
+    var providerId: String { "setting-enabling" }
+    var providerDisplayName: String { "Setting Enabling Mock" }
+    var isConfigured: Bool { true }
+    var transcriptionModels: [PluginModelInfo] { [] }
+    var selectedModelId: String? { nil }
+    func selectModel(_ modelId: String) {}
+    var supportsTranslation: Bool { false }
+    var dictionaryTermsSupport: DictionaryTermsSupport { isSettingEnabled ? .supported : .requiresPluginSetting }
+    var dictionaryTermsSettingSummary: String { "Recognizes terms better (about 100 MB download)." }
+
+    func enableDictionaryTermsSetting() async throws {
+        enableCallCount += 1
+        // Like Parakeet: the setting turns on before its model download can fail.
+        isSettingEnabled = true
+        if failsToEnable {
+            throw SettingEnablingTestError()
+        }
+    }
+
+    func transcribe(audio: AudioData, language: String?, translate: Bool, prompt: String?) async throws -> PluginTranscriptionResult {
+        PluginTranscriptionResult(text: "ok", detectedLanguage: language)
+    }
+}
+
+final class DictionaryTermsSettingSuggestionTests: XCTestCase {
+    private var defaults: UserDefaults!
+    private var suiteName: String!
+
+    override func setUp() {
+        super.setUp()
+        suiteName = "DictionaryTermsSettingSuggestionTests-\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suiteName)
+    }
+
+    override func tearDown() {
+        defaults.removePersistentDomain(forName: suiteName)
+        PluginManager.shared = nil
+        super.tearDown()
+    }
+
+    func testPolicySuggestsOnlyForAddedTermsOnEnablableEnginesNeedingTheSetting() {
+        typealias Policy = DictionaryTermsSettingSuggestionPolicy
+
+        XCTAssertTrue(Policy.shouldSuggest(afterAdding: .term, support: .requiresPluginSetting, canEnable: true, isDismissed: false))
+        XCTAssertFalse(Policy.shouldSuggest(afterAdding: .correction, support: .requiresPluginSetting, canEnable: true, isDismissed: false))
+        XCTAssertFalse(Policy.shouldSuggest(afterAdding: .term, support: .requiresPluginSetting, canEnable: false, isDismissed: false))
+        XCTAssertFalse(Policy.shouldSuggest(afterAdding: .term, support: .requiresPluginSetting, canEnable: true, isDismissed: true))
+        XCTAssertFalse(Policy.shouldSuggest(afterAdding: .term, support: .supported, canEnable: true, isDismissed: false))
+        XCTAssertFalse(Policy.shouldSuggest(afterAdding: .term, support: .unsupported, canEnable: true, isDismissed: false))
+        XCTAssertFalse(Policy.shouldSuggest(afterAdding: .term, support: nil, canEnable: true, isDismissed: false))
+    }
+
+    func testPolicyKeepsSuggestionVisibleWhileEnablingOrAfterFailure() {
+        typealias Policy = DictionaryTermsSettingSuggestionPolicy
+
+        XCTAssertTrue(Policy.isVisible(support: .requiresPluginSetting, canEnable: true, isDismissed: false, activation: nil))
+        XCTAssertFalse(Policy.isVisible(support: .supported, canEnable: true, isDismissed: false, activation: nil))
+        XCTAssertTrue(Policy.isVisible(support: .supported, canEnable: true, isDismissed: false, activation: .enabling))
+        XCTAssertTrue(Policy.isVisible(support: .supported, canEnable: true, isDismissed: false, activation: .failed("x")))
+        XCTAssertFalse(Policy.isVisible(support: .requiresPluginSetting, canEnable: true, isDismissed: true, activation: nil))
+        XCTAssertFalse(Policy.isVisible(support: .requiresPluginSetting, canEnable: false, isDismissed: false, activation: nil))
+    }
+
+    @MainActor
+    func testAddingTermSuggestsSettingAndEnablingHidesSuggestion() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let plugin = SettingEnablingDictionaryEnginePlugin()
+        let viewModel = makeViewModel(selecting: plugin, appSupportDirectory: appSupportDirectory)
+
+        addEntry(.correction, "teh", to: viewModel)
+        XCTAssertNil(viewModel.visibleTermsSettingSuggestion)
+
+        addEntry(.term, "Kubernetes", to: viewModel)
+        let suggestion = try XCTUnwrap(viewModel.visibleTermsSettingSuggestion)
+        XCTAssertEqual(suggestion.providerId, plugin.providerId)
+        XCTAssertEqual(suggestion.engineName, "Setting Enabling Mock")
+        XCTAssertEqual(suggestion.summary, plugin.dictionaryTermsSettingSummary)
+        XCTAssertNil(suggestion.activation)
+
+        let finished = expectation(description: "Enabling finished")
+        let observation = viewModel.$termsSettingActivations
+            .dropFirst()
+            .sink { activations in
+                if activations.isEmpty { finished.fulfill() }
+            }
+        viewModel.enableSuggestedTermsSetting()
+        XCTAssertEqual(viewModel.visibleTermsSettingSuggestion?.activation, .enabling)
+        await fulfillment(of: [finished], timeout: 5)
+        observation.cancel()
+
+        XCTAssertEqual(plugin.enableCallCount, 1)
+        XCTAssertNil(viewModel.visibleTermsSettingSuggestion)
+        XCTAssertNil(viewModel.termsSettingSuggestionProviderId)
+
+        // Turning the setting off elsewhere does not bring the old suggestion back.
+        plugin.isSettingEnabled = false
+        XCTAssertNil(viewModel.visibleTermsSettingSuggestion)
+    }
+
+    @MainActor
+    func testFailedEnablingStaysVisibleAndNotNowIsRememberedPerEngine() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let plugin = SettingEnablingDictionaryEnginePlugin()
+        plugin.failsToEnable = true
+        let viewModel = makeViewModel(selecting: plugin, appSupportDirectory: appSupportDirectory)
+
+        addEntry(.term, "Kubernetes", to: viewModel)
+        let failed = expectation(description: "Enabling failed")
+        let observation = viewModel.$termsSettingActivations
+            .sink { activations in
+                if case .failed = activations[plugin.providerId] { failed.fulfill() }
+            }
+        viewModel.enableSuggestedTermsSetting()
+        await fulfillment(of: [failed], timeout: 5)
+        observation.cancel()
+
+        XCTAssertEqual(viewModel.visibleTermsSettingSuggestion?.activation, .failed("Download failed"))
+
+        viewModel.dismissTermsSettingSuggestion()
+        XCTAssertNil(viewModel.visibleTermsSettingSuggestion)
+        XCTAssertNil(viewModel.termsSettingActivations[plugin.providerId])
+        XCTAssertEqual(
+            defaults.stringArray(forKey: UserDefaultsKeys.dismissedDictionaryTermsSettingSuggestions),
+            [plugin.providerId]
+        )
+
+        plugin.isSettingEnabled = false
+        let reloadedDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(reloadedDirectory) }
+        let reloadedViewModel = makeViewModel(selecting: plugin, appSupportDirectory: reloadedDirectory)
+        addEntry(.term, "Kustomize", to: reloadedViewModel)
+        XCTAssertNil(reloadedViewModel.visibleTermsSettingSuggestion)
+    }
+
+    @MainActor
+    func testEnginesWithoutEnableActionDoNotRaiseSuggestion() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let plugin = UnsupportedDictionaryEnginePlugin()
+        plugin.supportValue = .requiresPluginSetting
+        let viewModel = makeViewModel(selecting: plugin, appSupportDirectory: appSupportDirectory)
+
+        addEntry(.term, "Kubernetes", to: viewModel)
+
+        XCTAssertNil(viewModel.termsSettingSuggestionProviderId)
+        XCTAssertNil(viewModel.visibleTermsSettingSuggestion)
+    }
+
+    @MainActor
+    private func makeViewModel(
+        selecting plugin: any TranscriptionEnginePlugin,
+        appSupportDirectory: URL
+    ) -> DictionaryViewModel {
+        PluginManager.shared = PluginManager(appSupportDirectory: appSupportDirectory)
+        PluginManager.shared.loadedPlugins = [
+            LoadedPlugin(
+                manifest: PluginManifest(
+                    id: "com.typewhisper.tests.\(plugin.providerId)",
+                    name: plugin.providerDisplayName,
+                    version: "1.0.0",
+                    principalClass: "DictionaryTermsSettingSuggestionTestsPlugin"
+                ),
+                instance: plugin,
+                bundle: Bundle.main,
+                sourceURL: appSupportDirectory,
+                isEnabled: true
+            )
+        ]
+        return DictionaryViewModel(
+            dictionaryService: DictionaryService(appSupportDirectory: appSupportDirectory),
+            defaults: defaults,
+            selectedTranscriptionEngine: { plugin }
+        )
+    }
+
+    @MainActor
+    private func addEntry(_ type: DictionaryEntryType, _ original: String, to viewModel: DictionaryViewModel) {
+        viewModel.startCreating(type: type)
+        viewModel.editOriginal = original
+        if type == .correction {
+            viewModel.editReplacement = "the"
+        }
+        viewModel.saveEditing()
     }
 }
 
@@ -1084,6 +1289,173 @@ final class DictionaryServiceTests: XCTestCase {
         XCTAssertEqual(service.entries.filter { $0.type == .term }.map(\.original), ["Cargo"])
         XCTAssertEqual(viewModel.activatedPackStates[v2.id]?.installedTerms, ["Cargo"])
         XCTAssertEqual(viewModel.activatedPackStates[v2.id]?.installedVersion, "1.1.0")
+    }
+
+    @MainActor
+    func testTermPackTermsStartAtPreciseBoostingWithoutChangingManualTerms() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let suiteName = "DictionaryPackPrecise-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        service.addEntry(type: .term, original: "Rust")
+        let viewModel = DictionaryViewModel(dictionaryService: service, defaults: defaults)
+
+        viewModel.activatePack(makeTermPack(id: "community-rust", terms: ["Rust", "Tokio"]))
+
+        XCTAssertNil(try XCTUnwrap(service.entries.first { $0.original == "Rust" }).ctcMinSimilarity)
+        XCTAssertEqual(
+            try XCTUnwrap(service.entries.first { $0.original == "Tokio" }).ctcMinSimilarity,
+            Float(DictionaryViewModel.preciseCtcMinSimilarity)
+        )
+        XCTAssertEqual(
+            viewModel.termBoostingLabel(for: service.entries.first { $0.original == "Tokio" }?.ctcMinSimilarity),
+            DictionaryViewModel.TermBoostingMode.precise.displayName
+        )
+    }
+
+    @MainActor
+    func testTermPackEntryOverridesSurviveTogglesAndUpdates() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let suiteName = "DictionaryPackOverrides-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        let viewModel = DictionaryViewModel(dictionaryService: service, defaults: defaults)
+        let apple = makeTermPack(
+            id: "apple",
+            terms: ["Combine", "Express", "Core Data"],
+            corrections: [TermPackCorrection(original: "swift ui", replacement: "SwiftUI")]
+        )
+        let devOps = makeTermPack(id: "devops", terms: ["Ansible"])
+
+        viewModel.activatePack(apple)
+        viewModel.activatePack(devOps)
+
+        func entry(_ original: String) -> DictionaryEntry? {
+            service.entries.first { $0.original == original }
+        }
+        let combine = try XCTUnwrap(entry("Combine"))
+        let combineID = combine.id
+        service.updateEntry(combine, original: "Combine", replacement: nil, caseSensitive: true, ctcMinSimilarity: 0.95)
+        service.setEntryEnabled(try XCTUnwrap(entry("Express")), enabled: false)
+        let coreData = try XCTUnwrap(entry("Core Data"))
+        service.updateEntry(coreData, original: "Core Data", replacement: nil, caseSensitive: true, ctcMinSimilarity: nil)
+        service.setEntryEnabled(try XCTUnwrap(entry("swift ui")), enabled: false)
+        let ansible = try XCTUnwrap(entry("Ansible"))
+        service.setEntryEnabled(ansible, enabled: false)
+
+        // Toggling another pack leaves the entries untouched.
+        viewModel.togglePack(devOps)
+        viewModel.togglePack(devOps)
+        XCTAssertEqual(entry("Combine")?.id, combineID)
+        XCTAssertEqual(entry("Combine")?.ctcMinSimilarity, 0.95)
+        XCTAssertEqual(entry("Express")?.isEnabled, false)
+        XCTAssertEqual(entry("Ansible")?.isEnabled, false)
+
+        // Toggling the pack itself restores its overrides.
+        viewModel.deactivatePack(apple)
+        XCTAssertNil(entry("Combine"))
+        viewModel.activatePack(apple)
+        XCTAssertEqual(entry("Combine")?.ctcMinSimilarity, 0.95)
+        XCTAssertEqual(entry("Express")?.isEnabled, false)
+        XCTAssertEqual(entry("Express")?.ctcMinSimilarity, Float(DictionaryViewModel.preciseCtcMinSimilarity))
+        XCTAssertEqual(entry("Core Data")?.isEnabled, true)
+        XCTAssertNil(try XCTUnwrap(entry("Core Data")).ctcMinSimilarity)
+        XCTAssertEqual(entry("swift ui")?.isEnabled, false)
+
+        // An update keeps overrides of remaining terms, applies changed spelling and case
+        // sensitivity, adds new terms at the pack default and forgets terms the pack dropped.
+        let updatedApple = makeTermPack(
+            id: "apple",
+            terms: ["COMBINE", "Core Data", "SwiftData"],
+            corrections: [TermPackCorrection(original: "Swift UI", replacement: "SwiftUI", caseSensitive: false)],
+            version: "1.1.0"
+        )
+        let combineBeforeUpdateID = try XCTUnwrap(entry("Combine")).id
+        let correctionBeforeUpdateID = try XCTUnwrap(entry("swift ui")).id
+        viewModel.updatePack(updatedApple)
+        XCTAssertEqual(entry("COMBINE")?.id, combineBeforeUpdateID)
+        XCTAssertEqual(entry("COMBINE")?.ctcMinSimilarity, 0.95)
+        XCTAssertNil(entry("Express"))
+        XCTAssertEqual(entry("SwiftData")?.ctcMinSimilarity, Float(DictionaryViewModel.preciseCtcMinSimilarity))
+        let updatedCorrection = try XCTUnwrap(entry("Swift UI"))
+        XCTAssertEqual(updatedCorrection.id, correctionBeforeUpdateID)
+        XCTAssertEqual(updatedCorrection.caseSensitive, false)
+        XCTAssertEqual(updatedCorrection.isEnabled, false)
+
+        // Overrides of a deactivated pack survive a relaunch.
+        viewModel.deactivatePack(updatedApple)
+        let relaunchedViewModel = DictionaryViewModel(dictionaryService: service, defaults: defaults)
+        relaunchedViewModel.activatePack(updatedApple)
+        XCTAssertEqual(entry("COMBINE")?.ctcMinSimilarity, 0.95)
+        XCTAssertEqual(entry("Swift UI")?.isEnabled, false)
+
+        // Resetting all packs forgets the overrides.
+        relaunchedViewModel.requestReset(.deactivateAllTermPacks)
+        relaunchedViewModel.confirmReset()
+        relaunchedViewModel.activatePack(updatedApple)
+        XCTAssertEqual(entry("COMBINE")?.ctcMinSimilarity, Float(DictionaryViewModel.preciseCtcMinSimilarity))
+        XCTAssertEqual(entry("Swift UI")?.isEnabled, true)
+    }
+
+    @MainActor
+    func testExistingAutoPackTermsMigrateToPreciseOnce() throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        defer { TestSupport.remove(appSupportDirectory) }
+        let suiteName = "DictionaryPackMigration-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let service = DictionaryService(appSupportDirectory: appSupportDirectory)
+        service.addEntries([
+            (type: .term, original: "Tokio", replacement: nil, caseSensitive: true),
+            (type: .term, original: "Manual", replacement: nil, caseSensitive: false),
+        ])
+        let legacyState = ActivatedTermPackState(
+            packID: "community-rust",
+            source: "community",
+            installedVersion: "1.0.0",
+            installedTerms: ["Tokio"],
+            installedCorrections: [],
+            requiresCommercialLicense: nil
+        )
+        defaults.set(try JSONEncoder().encode([legacyState]), forKey: UserDefaultsKeys.activatedTermPackStates)
+
+        _ = DictionaryViewModel(dictionaryService: service, defaults: defaults)
+        let precise = Float(DictionaryViewModel.preciseCtcMinSimilarity)
+        XCTAssertEqual(service.entries.first { $0.original == "Tokio" }?.ctcMinSimilarity, precise)
+        XCTAssertNil(try XCTUnwrap(service.entries.first { $0.original == "Manual" }).ctcMinSimilarity)
+
+        // A later choice of Auto is respected.
+        let tokio = try XCTUnwrap(service.entries.first { $0.original == "Tokio" })
+        service.updateEntry(tokio, original: "Tokio", replacement: nil, caseSensitive: true, ctcMinSimilarity: nil)
+        _ = DictionaryViewModel(dictionaryService: service, defaults: defaults)
+        XCTAssertNil(try XCTUnwrap(service.entries.first { $0.original == "Tokio" }).ctcMinSimilarity)
+    }
+
+    private func makeTermPack(
+        id: String,
+        terms: [String],
+        corrections: [TermPackCorrection] = [],
+        version: String = "1.0.0"
+    ) -> TermPack {
+        TermPack(
+            id: id,
+            name: id,
+            description: "Test pack",
+            icon: "shippingbox",
+            terms: terms,
+            corrections: corrections,
+            version: version,
+            author: "Tests",
+            localizedNames: nil,
+            localizedDescriptions: nil
+        )
     }
 
     @MainActor

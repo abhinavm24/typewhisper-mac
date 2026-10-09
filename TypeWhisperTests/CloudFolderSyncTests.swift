@@ -91,6 +91,10 @@ private final class InMemoryUserDataSyncStore: UserDataSyncStore, @unchecked Sen
                 upsertHistory(inbox: inbox)
             case .upsertHistoryAudio(let audio):
                 upsertHistory(audio: audio)
+            case .upsertHistoryTranscript(let transcript):
+                upsertHistory(recordID: transcript.recordID, updatedAt: transcript.updatedAt, transcript: transcript)
+            case .upsertHistorySpeakers(let speakers):
+                upsertHistory(recordID: speakers.recordID, updatedAt: speakers.updatedAt, speakers: speakers)
             case .deleteHistory(let recordID):
                 historyRecords.removeAll { $0.content.recordID == recordID }
             }
@@ -107,6 +111,8 @@ private final class InMemoryUserDataSyncStore: UserDataSyncStore, @unchecked Sen
                     updatedAt: content.createdAt
                 ),
                 audio: existing?.audio,
+                transcript: existing?.transcript,
+                speakers: existing?.speakers,
                 localAudioFileURL: existing?.localAudioFileURL,
                 audioEligible: existing?.audioEligible ?? false
             )
@@ -123,6 +129,8 @@ private final class InMemoryUserDataSyncStore: UserDataSyncStore, @unchecked Sen
                 ),
                 inbox: inbox,
                 audio: existing?.audio,
+                transcript: existing?.transcript,
+                speakers: existing?.speakers,
                 localAudioFileURL: existing?.localAudioFileURL,
                 audioEligible: existing?.audioEligible ?? false
             )
@@ -142,8 +150,30 @@ private final class InMemoryUserDataSyncStore: UserDataSyncStore, @unchecked Sen
                     updatedAt: audio.createdAt
                 ),
                 audio: audio,
+                transcript: existing?.transcript,
+                speakers: existing?.speakers,
                 localAudioFileURL: existing?.localAudioFileURL,
                 audioEligible: false
+            )
+        )
+    }
+
+    private func upsertHistory(
+        recordID: UUID,
+        updatedAt: Date,
+        transcript: UserDataSyncHistoryTranscriptV1? = nil,
+        speakers: UserDataSyncHistorySpeakersV1? = nil
+    ) {
+        let existing = historyRecords.first { $0.content.recordID == recordID }
+        replaceHistory(
+            UserDataSyncHistoryRecord(
+                content: existing?.content ?? Self.placeholderContent(recordID: recordID, updatedAt: updatedAt),
+                inbox: existing?.inbox ?? Self.placeholderInbox(recordID: recordID, updatedAt: updatedAt),
+                audio: existing?.audio,
+                transcript: transcript ?? existing?.transcript,
+                speakers: speakers ?? existing?.speakers,
+                localAudioFileURL: existing?.localAudioFileURL,
+                audioEligible: existing?.audioEligible ?? false
             )
         )
     }
@@ -282,9 +312,11 @@ private final class RecordingPremiumICloudBridge: PremiumICloudBridging, @unchec
     private let lock = NSLock()
     private var storedSynchronizeCount = 0
     private var storedDeleteCount = 0
+    private var storedRemovedDeviceIDs: [String] = []
 
     var synchronizeCount: Int { lock.withLock { storedSynchronizeCount } }
     var deleteCount: Int { lock.withLock { storedDeleteCount } }
+    var removedDeviceIDs: [String] { lock.withLock { storedRemovedDeviceIDs } }
 
     init(localFolderURL: URL) {
         self.localFolderURL = localFolderURL
@@ -296,6 +328,32 @@ private final class RecordingPremiumICloudBridge: PremiumICloudBridging, @unchec
 
     func deleteRemotePackage() async throws {
         lock.withLock { storedDeleteCount += 1 }
+    }
+
+    func removeDevice(_ deviceID: String) async throws {
+        lock.withLock { storedRemovedDeviceIDs.append(deviceID) }
+        if let removalGate {
+            await removalGate.wait()
+        }
+    }
+
+    /// Holds removals until opened, to request a sync while one is running.
+    var removalGate: RemovalGate?
+}
+
+private actor RemovalGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        waiters.forEach { $0.resume() }
+        waiters.removeAll()
     }
 }
 
@@ -1037,6 +1095,136 @@ final class CloudFolderSyncTests: XCTestCase {
         XCTAssertNil(controller.errorMessage)
     }
 
+    func testDeviceRemovalRemovesTheRecordsOfOneInstallationOnly() throws {
+        let package = try TestSupport.makeTemporaryDirectory(prefix: "PremiumSyncDeviceRemoval")
+        defer { TestSupport.remove(package) }
+        try Self.writeDeviceRecord("phone-new", origin: "phone-origin", in: package)
+        try Self.writeDeviceRecord("phone-old", origin: " phone-origin ", in: package)
+        try Self.writeDeviceRecord("ipad", origin: "ipad-origin", in: package)
+        try Self.writeDeviceRecord("mac", origin: nil, in: package)
+
+        try PremiumSyncDeviceRemoval.removeRecords(of: "phone-new", inPackages: [package])
+        XCTAssertEqual(try Self.deviceRecordNames(in: package), ["ipad.json", "mac.json"])
+
+        try PremiumSyncDeviceRemoval.removeRecords(of: "mac", inPackages: [package])
+        XCTAssertEqual(try Self.deviceRecordNames(in: package), ["ipad.json"])
+
+        XCTAssertThrowsError(try PremiumSyncDeviceRemoval.removeRecords(of: "../ipad", inPackages: [package]))
+        // An unreadable or missing record fails instead of reporting a removal.
+        XCTAssertThrowsError(try PremiumSyncDeviceRemoval.removeRecords(of: "unknown", inPackages: [package])) {
+            XCTAssertEqual($0 as? PremiumSyncDeviceRemoval.Failure, .recordUnreadable)
+        }
+        XCTAssertEqual(try Self.deviceRecordNames(in: package), ["ipad.json"])
+    }
+
+    func testDeviceRemovalUsesTheInstallationFromEitherSide() throws {
+        let mirror = try TestSupport.makeTemporaryDirectory(prefix: "PremiumSyncDeviceRemovalMirror")
+        let cloud = try TestSupport.makeTemporaryDirectory(prefix: "PremiumSyncDeviceRemovalCloud")
+        defer {
+            TestSupport.remove(mirror)
+            TestSupport.remove(cloud)
+        }
+        // The record is only in the mirror; iCloud has an older record of the same installation.
+        try Self.writeDeviceRecord("phone-new", origin: "phone-origin", in: mirror)
+        try Self.writeDeviceRecord("phone-old", origin: "phone-origin", in: cloud)
+        try Self.writeDeviceRecord("mac", origin: "mac-origin", in: cloud)
+
+        try PremiumSyncDeviceRemoval.removeRecords(of: "phone-new", inPackages: [mirror, cloud])
+
+        XCTAssertEqual(try Self.deviceRecordNames(in: mirror), [])
+        XCTAssertEqual(try Self.deviceRecordNames(in: cloud), ["mac.json"])
+    }
+
+    private static func writeDeviceRecord(_ deviceID: String, origin: String?, in package: URL) throws {
+        let devices = package.appendingPathComponent("devices", isDirectory: true)
+        try FileManager.default.createDirectory(at: devices, withIntermediateDirectories: true)
+        var record: [String: Any] = ["deviceId": deviceID, "platform": "iOS", "appVersion": "1.2"]
+        if let origin { record["historyOriginDeviceID"] = origin }
+        try JSONSerialization.data(withJSONObject: record)
+            .write(to: devices.appendingPathComponent("\(deviceID).json"))
+    }
+
+    private static func deviceRecordNames(in package: URL) throws -> Set<String> {
+        Set(try FileManager.default.contentsOfDirectory(
+            atPath: package.appendingPathComponent("devices", isDirectory: true).path
+        ))
+    }
+
+    @MainActor
+    func testAutomaticSyncRemovesOtherDevicesThroughTheBridge() async throws {
+        let suiteName = "PremiumSyncRemoveDevice-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let folder = try TestSupport.makeTemporaryDirectory(prefix: "PremiumSyncRemoveDevice")
+        defer { TestSupport.remove(folder) }
+
+        let privateKey = P256.Signing.PrivateKey()
+        defaults.set(
+            try Self.entitlementEncoder.encode(Self.signedEntitlement(privateKey: privateKey)),
+            forKey: "premium.account.cachedEntitlement"
+        )
+        defaults.set(PremiumSyncMode.off.rawValue, forKey: "premiumSync.mode")
+        let account = PremiumAccountService(
+            defaults: defaults,
+            keychainService: suiteName,
+            entitlementPublicKeyBase64: privateKey.publicKey.rawRepresentation.base64EncodedString(),
+            isSignedInOverride: true,
+            automaticallyRefresh: false
+        )
+        let bridge = RecordingPremiumICloudBridge(localFolderURL: folder)
+        let controller = CloudFolderSyncController(
+            premiumAccountService: account,
+            syncStore: InMemoryUserDataSyncStore(),
+            defaults: defaults,
+            automaticICloudBridge: bridge,
+            automaticICloudAvailable: true
+        )
+        defer { controller.deactivate() }
+        await controller.setMode(.automaticICloud)
+
+        let phone = CloudFolderSyncDeviceRecord(
+            deviceId: "phone",
+            historyOriginDeviceID: "phone-origin",
+            platform: "iOS",
+            appVersion: "1.2",
+            updatedAt: Self.date(20),
+            name: "iPhone"
+        )
+        let devicesURL = CloudFolderSyncEngine.packageURL(for: folder)
+            .appendingPathComponent("devices", isDirectory: true)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        try encoder.encode(phone).write(to: devicesURL.appendingPathComponent("phone.json"))
+        await controller.syncNow()
+
+        let mac = try XCTUnwrap(controller.devices.first { $0.platform == "macOS" })
+        XCTAssertTrue(controller.isCurrentDevice(mac))
+        XCTAssertFalse(controller.isCurrentDevice(phone))
+
+        await controller.removeDevice(mac)
+        XCTAssertEqual(bridge.removedDeviceIDs, [])
+
+        await controller.removeDevice(phone)
+        XCTAssertEqual(bridge.removedDeviceIDs, ["phone"])
+        XCTAssertNil(controller.errorMessage)
+        XCTAssertFalse(controller.isSyncing)
+
+        // A sync requested while a removal runs is not lost.
+        let gate = RemovalGate()
+        bridge.removalGate = gate
+        let synchronizationsBefore = bridge.synchronizeCount
+        let removal = Task { await controller.removeDevice(phone) }
+        while bridge.removedDeviceIDs.count < 2 { await Task.yield() }
+        await controller.syncNow()
+        XCTAssertEqual(bridge.synchronizeCount, synchronizationsBefore)
+        await gate.open()
+        await removal.value
+        for _ in 0..<200 where bridge.synchronizeCount == synchronizationsBefore {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertGreaterThan(bridge.synchronizeCount, synchronizationsBefore)
+    }
+
     @MainActor
     func testLaunchSyncsOnceAndIdlePollsOnlySyncAfterChanges() async throws {
         let suiteName = "PremiumSyncIdlePoll-\(UUID().uuidString)"
@@ -1494,6 +1682,225 @@ final class CloudFolderSyncTests: XCTestCase {
         }
     }
 
+    func testICloudBridgeFirstSyncWithoutBaseOnlyMergesAndRecordsBase() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("ops/mac/local.json", in: localRoot, seconds: 10)
+        try Self.writeBridgeFile("ops/ios/remote.json", in: remoteRoot, seconds: 10)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: PremiumICloudBridgeFileMirror.mirrorStateURL(localRoot: localRoot).path
+        ))
+
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        for root in [localRoot, remoteRoot] {
+            XCTAssertTrue(Self.bridgeFileExists("ops/mac/local.json", in: root))
+            XCTAssertTrue(Self.bridgeFileExists("ops/ios/remote.json", in: root))
+        }
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: PremiumICloudBridgeFileMirror.mirrorStateURL(localRoot: localRoot).path
+        ))
+        // The hidden state file stays out of both packages.
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: remoteRoot.appendingPathComponent(PremiumICloudBridgeConstants.mirrorStateFileName).path
+        ))
+        XCTAssertFalse(Self.bridgeFileExists(PremiumICloudBridgeConstants.mirrorStateFileName, in: remoteRoot))
+    }
+
+    func testICloudBridgePropagatesRemoteDeletionToLocalMirror() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("ops/ios/expired.json", in: remoteRoot, seconds: 10)
+        try Self.writeBridgeFile("devices/iphone.json", in: remoteRoot, seconds: 10)
+        try Self.writeBridgeFile("manifest.json", in: remoteRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+        XCTAssertTrue(Self.bridgeFileExists("ops/ios/expired.json", in: localRoot))
+
+        for path in ["ops/ios/expired.json", "devices/iphone.json"] {
+            try FileManager.default.removeItem(at: Self.bridgeFileURL(path, in: remoteRoot))
+        }
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        for root in [localRoot, remoteRoot] {
+            XCTAssertFalse(Self.bridgeFileExists("ops/ios/expired.json", in: root))
+            XCTAssertFalse(Self.bridgeFileExists("devices/iphone.json", in: root))
+            XCTAssertTrue(Self.bridgeFileExists("manifest.json", in: root))
+        }
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+        XCTAssertFalse(Self.bridgeFileExists("devices/iphone.json", in: remoteRoot))
+    }
+
+    func testICloudBridgePropagatesLocalDeletionToICloud() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("devices/iphone.json", in: localRoot, seconds: 10)
+        try Self.writeBridgeFile("ops/mac/expired.json", in: localRoot, seconds: 10)
+        try Self.writeBridgeFile("manifest.json", in: localRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+        XCTAssertTrue(Self.bridgeFileExists("devices/iphone.json", in: remoteRoot))
+
+        for path in ["devices/iphone.json", "ops/mac/expired.json"] {
+            try FileManager.default.removeItem(at: Self.bridgeFileURL(path, in: localRoot))
+        }
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        for root in [localRoot, remoteRoot] {
+            XCTAssertFalse(Self.bridgeFileExists("devices/iphone.json", in: root))
+            XCTAssertFalse(Self.bridgeFileExists("ops/mac/expired.json", in: root))
+            XCTAssertTrue(Self.bridgeFileExists("manifest.json", in: root))
+        }
+    }
+
+    func testICloudBridgeRestoresFilesRewrittenAfterTheirDeletionOnTheOtherSide() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("manifest.json", in: localRoot, seconds: 10)
+        try Self.writeBridgeFile("devices/iphone.json", in: localRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        // Deleted remotely, rewritten locally.
+        try FileManager.default.removeItem(at: Self.bridgeFileURL("manifest.json", in: remoteRoot))
+        try Self.writeBridgeFile("manifest.json", in: localRoot, contents: "local-v2", seconds: 20)
+        // Deleted locally, rewritten remotely.
+        try FileManager.default.removeItem(at: Self.bridgeFileURL("devices/iphone.json", in: localRoot))
+        try Self.writeBridgeFile("devices/iphone.json", in: remoteRoot, contents: "remote-v2", seconds: 20)
+
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        for root in [localRoot, remoteRoot] {
+            XCTAssertEqual(
+                try Data(contentsOf: Self.bridgeFileURL("manifest.json", in: root)),
+                Data("local-v2".utf8)
+            )
+            XCTAssertEqual(
+                try Data(contentsOf: Self.bridgeFileURL("devices/iphone.json", in: root)),
+                Data("remote-v2".utf8)
+            )
+        }
+    }
+
+    func testICloudBridgeDeletedRemotePackageRemovesOnlyMirroredLocalFiles() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("manifest.json", in: remoteRoot, seconds: 10)
+        try Self.writeBridgeFile("ops/ios/operation.json", in: remoteRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+        XCTAssertTrue(Self.bridgeFileExists("ops/ios/operation.json", in: localRoot))
+
+        try FileManager.default.removeItem(
+            at: remoteRoot.appendingPathComponent("typewhisper-sync", isDirectory: true)
+        )
+        try Self.writeBridgeFile("ops/mac/new.json", in: localRoot, seconds: 20)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        for root in [localRoot, remoteRoot] {
+            XCTAssertFalse(Self.bridgeFileExists("manifest.json", in: root))
+            XCTAssertFalse(Self.bridgeFileExists("ops/ios/operation.json", in: root))
+            XCTAssertTrue(Self.bridgeFileExists("ops/mac/new.json", in: root))
+        }
+        // The emptied ops/ios directory is not recreated as an empty skeleton in iCloud.
+        XCTAssertFalse(Self.bridgeFileExists("ops/ios", in: remoteRoot))
+    }
+
+    func testICloudBridgeResetLocalMirrorDoesNotEmptyICloud() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("manifest.json", in: remoteRoot, seconds: 10)
+        try Self.writeBridgeFile("ops/ios/operation.json", in: remoteRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        // Erasing all data removes the local package; other devices' data must survive.
+        try FileManager.default.removeItem(
+            at: localRoot.appendingPathComponent("typewhisper-sync", isDirectory: true)
+        )
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        for root in [localRoot, remoteRoot] {
+            XCTAssertTrue(Self.bridgeFileExists("manifest.json", in: root))
+            XCTAssertTrue(Self.bridgeFileExists("ops/ios/operation.json", in: root))
+        }
+    }
+
+    func testICloudBridgeCopiesNewFilesOnBothSidesAfterBaseIsRecorded() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("manifest.json", in: localRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        try Self.writeBridgeFile("ops/mac/new.json", in: localRoot, seconds: 20)
+        try Self.writeBridgeFile("ops/ios/new.json", in: remoteRoot, seconds: 20)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        for root in [localRoot, remoteRoot] {
+            XCTAssertTrue(Self.bridgeFileExists("manifest.json", in: root))
+            XCTAssertTrue(Self.bridgeFileExists("ops/mac/new.json", in: root))
+            XCTAssertTrue(Self.bridgeFileExists("ops/ios/new.json", in: root))
+        }
+    }
+
+    func testICloudBridgeDeletesNothingWhenICloudCannotBeListed() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        let unreadable = Self.bridgeFileURL("devices", in: remoteRoot)
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: NSNumber(value: 0o755)],
+                ofItemAtPath: unreadable.path
+            )
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("ops/ios/operation.json", in: remoteRoot, seconds: 10)
+        try Self.writeBridgeFile("devices/iphone.json", in: remoteRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        try FileManager.default.removeItem(at: Self.bridgeFileURL("ops/ios/operation.json", in: remoteRoot))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: NSNumber(value: 0)],
+            ofItemAtPath: unreadable.path
+        )
+        XCTAssertThrowsError(
+            try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+        )
+        XCTAssertTrue(Self.bridgeFileExists("ops/ios/operation.json", in: localRoot))
+    }
+
+    func testICloudBridgeDeletingPackagesClearsMirrorState() throws {
+        let (localRoot, remoteRoot) = try Self.makeBridgeRoots()
+        defer {
+            TestSupport.remove(localRoot)
+            TestSupport.remove(remoteRoot)
+        }
+        try Self.writeBridgeFile("manifest.json", in: localRoot, seconds: 10)
+        try PremiumICloudBridgeFileMirror.synchronize(localRoot: localRoot, remoteRoot: remoteRoot)
+        let stateURL = PremiumICloudBridgeFileMirror.mirrorStateURL(localRoot: localRoot)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stateURL.path))
+
+        try PremiumICloudBridgeFileMirror.deletePackages(localRoot: localRoot, remoteRoot: remoteRoot)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stateURL.path))
+    }
+
     func testICloudBridgeUsesConfiguredContainerIdentifier() {
         XCTAssertEqual(
             PremiumICloudBridgeConstants.containerIdentifier(
@@ -1843,6 +2250,38 @@ final class CloudFolderSyncTests: XCTestCase {
     }
 
     @MainActor
+    func testHistoryComponentFromANewerClientIsIgnoredWithoutDiagnostic() async throws {
+        let folder = try TestSupport.makeTemporaryDirectory(prefix: "CloudFolderSyncNewComponent")
+        defer { TestSupport.remove(folder) }
+
+        let remoteDirectory = CloudFolderSyncEngine.packageURL(for: folder)
+            .appendingPathComponent("ops/remote-device", isDirectory: true)
+        try FileManager.default.createDirectory(at: remoteDirectory, withIntermediateDirectories: true)
+        let recordID = UUID().uuidString
+        let operation = """
+        {"schemaVersion":1,"operationId":"op-1","deviceId":"remote-device","collection":"history",
+         "itemId":"history:\(recordID)","kind":"upsert","updatedAt":"2026-09-26T14:02:11Z",
+         "historyPayloadVersion":1,"historyGeneration":"g1","historyComponent":"summary",
+         "historySummary":{"recordID":"\(recordID)","text":"A summary"}}
+        """
+        try Data(operation.utf8).write(to: remoteDirectory.appendingPathComponent("summary.json"))
+
+        let store = InMemoryUserDataSyncStore()
+        var state = CloudFolderSyncState(deviceId: "mac-a")
+
+        let result = try await CloudFolderSyncEngine.sync(
+            folderURL: folder,
+            store: store,
+            state: &state,
+            entitlements: PaidEntitlements(canUseCloudFolderSync: true),
+            now: Self.date(20)
+        )
+
+        XCTAssertEqual(result.mutationsApplied, 0)
+        XCTAssertTrue(result.diagnostics.isEmpty)
+    }
+
+    @MainActor
     func testFutureSchemaIsDiagnosedBeforeFullOperationDecoding() async throws {
         let folder = try TestSupport.makeTemporaryDirectory(prefix: "CloudFolderSyncFutureSchema")
         defer { TestSupport.remove(folder) }
@@ -2053,6 +2492,356 @@ final class CloudFolderSyncTests: XCTestCase {
                     .path
             )
         )
+    }
+
+    @MainActor
+    func testSpeakerSyncGoldenFixturesDecodeAndRoundTrip() throws {
+        let recordID = UUID(uuidString: "7F0C2D6E-2B1A-4C59-9B55-0A6F3C1D2E4F")!
+        let revision = UUID(uuidString: "C1D9A3B2-5E6F-4A7B-8C9D-0E1F2A3B4C5D")!
+
+        let transcriptOperation: CloudFolderSyncOperation = try Self.decodeFixture("upsert-history-transcript-v1")
+        let transcript = try XCTUnwrap(transcriptOperation.historyTranscript)
+        XCTAssertEqual(transcriptOperation.historyComponent, .transcript)
+        XCTAssertEqual(transcriptOperation.updatedAt, transcript.updatedAt)
+        XCTAssertEqual(transcript.recordID, recordID)
+        XCTAssertEqual(transcript.revision, revision)
+        XCTAssertEqual(transcript.requestedSpeakerCount, 2)
+        XCTAssertEqual(transcript.source, .init(kind: "local", engine: "fluidaudio-offline-diarizer", modelVersion: nil))
+        XCTAssertEqual(transcript.segments.map(\.speakerID), ["S1", "S2", nil])
+        XCTAssertEqual(transcript.segments.map(\.speakerConfidence), [0.75, nil, nil])
+        XCTAssertEqual(transcript.segments.map(\.start), [0, 4.5, 10])
+        XCTAssertEqual(transcript.segments[0].text, "Let's start with the budget.")
+        XCTAssertTrue(transcript.isValid)
+        XCTAssertEqual(CloudFolderSyncEngine.winningOperations(from: [transcriptOperation]).count, 1)
+
+        let speakersOperation: CloudFolderSyncOperation = try Self.decodeFixture("upsert-history-speakers-v1")
+        let speakers = try XCTUnwrap(speakersOperation.historySpeakers)
+        XCTAssertEqual(speakersOperation.historyComponent, .speakers)
+        XCTAssertEqual(speakers.recordID, recordID)
+        XCTAssertEqual(speakers.transcriptRevision, revision)
+        XCTAssertEqual(speakers.names.map(\.displayName), ["Anna", "Marco"])
+        XCTAssertEqual(speakers.names.map(\.speakerID), ["S1", "S2"])
+        XCTAssertEqual(speakers.names[0].profileID, UUID(uuidString: "9A8B7C6D-5E4F-4A3B-9C2D-1E0F9A8B7C6D"))
+        XCTAssertNil(speakers.names[1].profileID)
+        XCTAssertEqual(speakers.names[0].updatedAt, ISO8601DateFormatter().date(from: "2026-09-26T14:10:30Z"))
+        // A name without its own date takes the payload's date.
+        XCTAssertNil(speakers.names[1].updatedAt)
+        XCTAssertEqual(speakers.entries[1].updatedAt, speakers.updatedAt)
+        XCTAssertEqual(speakers.cleared, [.init(speakerID: "S3", updatedAt: ISO8601DateFormatter().date(from: "2026-09-26T14:10:35Z")!)])
+        XCTAssertTrue(speakers.isValid)
+        XCTAssertEqual(CloudFolderSyncEngine.winningOperations(from: [speakersOperation]).count, 1)
+
+        let device: CloudFolderSyncDeviceRecord = try Self.decodeFixture("device-capabilities-v1")
+        XCTAssertEqual(device.capabilities, ["history.transcript.v1"])
+        XCTAssertTrue(device.syncsSpeakerTranscripts)
+        let olderDevice: CloudFolderSyncDeviceRecord = try Self.decodeFixture("device-v1")
+        XCTAssertNil(olderDevice.capabilities)
+        XCTAssertFalse(olderDevice.syncsSpeakerTranscripts)
+
+        // What this app writes decodes to the same values again.
+        for operation in [transcriptOperation, speakersOperation] {
+            let data = try Self.entitlementEncoder.encode(operation)
+            XCTAssertEqual(try Self.fixtureDecoder.decode(CloudFolderSyncOperation.self, from: data), operation)
+        }
+        // The local model and the wire payload convert without loss.
+        XCTAssertEqual(
+            UserDataSyncHistoryTranscriptV1(
+                recordID: recordID,
+                updatedAt: transcript.updatedAt,
+                transcript: transcript.speakerTranscript
+            ),
+            transcript
+        )
+        // Converting back writes the payload's date into names that had none.
+        let converted = UserDataSyncHistorySpeakersV1(
+            recordID: recordID,
+            updatedAt: speakers.updatedAt,
+            transcriptRevision: revision,
+            table: speakers.nameTable(keepingSuggestionsFrom: nil)
+        )
+        XCTAssertEqual(converted.entries, speakers.entries)
+        XCTAssertEqual(converted.cleared, speakers.cleared)
+        XCTAssertEqual(converted.updatedAt, speakers.updatedAt)
+    }
+
+    func testSpeakerPayloadsWithBadValuesAreNotApplied() throws {
+        let transcriptOperation: CloudFolderSyncOperation = try Self.decodeFixture("upsert-history-transcript-v1")
+        let speakersOperation: CloudFolderSyncOperation = try Self.decodeFixture("upsert-history-speakers-v1")
+        let recordID = try XCTUnwrap(transcriptOperation.historyTranscript?.recordID)
+        let revision = try XCTUnwrap(transcriptOperation.historyTranscript?.revision)
+
+        func speakers(_ names: [UserDataSyncHistorySpeakersV1.Name]) throws -> UserDataSyncHistorySpeakersV1 {
+            let json = try JSONSerialization.data(withJSONObject: [
+                "recordID": recordID.uuidString,
+                "updatedAt": "2026-09-26T14:10:40.000Z",
+                "transcriptRevision": revision.uuidString,
+                "names": names.map { ["speakerID": $0.speakerID, "displayName": $0.displayName] },
+            ])
+            return try Self.fixtureDecoder.decode(UserDataSyncHistorySpeakersV1.self, from: json)
+        }
+        XCTAssertFalse(try speakers([.init(speakerID: "X1", displayName: "Anna", profileID: nil)]).isValid)
+        XCTAssertFalse(try speakers([.init(speakerID: "S1", displayName: "  ", profileID: nil)]).isValid)
+        XCTAssertFalse(try speakers([.init(speakerID: "S1", displayName: String(repeating: "a", count: 101), profileID: nil)]).isValid)
+        XCTAssertFalse(try speakers([
+            .init(speakerID: "S1", displayName: "Anna", profileID: nil),
+            .init(speakerID: "S1", displayName: "Ben", profileID: nil),
+        ]).isValid)
+        XCTAssertTrue(try speakers([]).isValid)
+
+        // Two payloads in one operation, or a payload for another record, are rejected.
+        var mixed = transcriptOperation
+        mixed.historySpeakers = speakersOperation.historySpeakers
+        XCTAssertTrue(CloudFolderSyncEngine.winningOperations(from: [mixed]).isEmpty)
+
+        let otherItem = try Self.fixtureDecoder.decode(
+            CloudFolderSyncOperation.self,
+            from: Data(String(
+                decoding: try Self.entitlementEncoder.encode(speakersOperation),
+                as: UTF8.self
+            ).replacingOccurrences(
+                of: "history:7f0c2d6e-2b1a-4c59-9b55-0a6f3c1d2e4f",
+                with: "history:00000000-0000-4000-8000-000000000001"
+            ).utf8)
+        )
+        XCTAssertTrue(CloudFolderSyncEngine.winningOperations(from: [otherItem]).isEmpty)
+    }
+
+    @MainActor
+    func testSpeakerTranscriptAndNamesSyncAsIndependentComponents() async throws {
+        let folder = try TestSupport.makeTemporaryDirectory(prefix: "CloudFolderSyncSpeakers")
+        defer { TestSupport.remove(folder) }
+
+        let recordID = UUID(uuidString: "83600000-0000-4000-8000-0000000000A1")!
+        let transcript = UserDataSyncHistoryTranscriptV1(
+            recordID: recordID,
+            updatedAt: Self.date(10),
+            transcript: SpeakerTranscript(source: .localDiarizer, segments: [
+                SpeakerTranscriptSegment(text: "Good morning.", start: 0, end: 1, speakerID: "S1"),
+                SpeakerTranscriptSegment(text: "Morning.", start: 1, end: 2, speakerID: "S2"),
+            ])
+        )
+        var table = SpeakerNameTable(transcriptRevision: transcript.revision)
+        table.setName("Anna", for: "S1")
+        table.setName("Guess", for: "S2", profileID: UUID(), isSuggestion: true)
+        let base = Self.historyRecord(
+            recordID: recordID,
+            finalText: "Good morning. Morning.",
+            contentUpdatedAt: Self.date(10),
+            inboxState: "none",
+            inboxUpdatedAt: Self.date(10)
+        )
+        let phone = InMemoryUserDataSyncStore(historyRecords: [UserDataSyncHistoryRecord(
+            content: base.content,
+            inbox: base.inbox,
+            audio: nil,
+            transcript: transcript,
+            speakers: UserDataSyncHistorySpeakersV1(
+                recordID: recordID,
+                updatedAt: Self.date(11),
+                transcriptRevision: transcript.revision,
+                table: table
+            ),
+            localAudioFileURL: nil,
+            audioEligible: false
+        )])
+        let mac = InMemoryUserDataSyncStore()
+        var phoneState = CloudFolderSyncState(deviceId: "ios-phone")
+        var macState = CloudFolderSyncState(deviceId: "mac-main")
+        func sync(_ store: InMemoryUserDataSyncStore, _ state: inout CloudFolderSyncState, at seconds: TimeInterval) async throws -> CloudFolderSyncResult {
+            try await CloudFolderSyncEngine.sync(
+                folderURL: folder,
+                store: store,
+                state: &state,
+                entitlements: PaidEntitlements(canUseCloudFolderSync: true),
+                now: Self.date(seconds)
+            )
+        }
+
+        let exported = try await sync(phone, &phoneState, at: 20)
+        let imported = try await sync(mac, &macState, at: 30)
+
+        XCTAssertEqual(exported.operationsWritten, 4)
+        XCTAssertEqual(imported.mutationsApplied, 4)
+        XCTAssertEqual(mac.historyRecords.first?.transcript, transcript)
+        // The suggestion stays on the phone; only the confirmed name arrives.
+        XCTAssertEqual(mac.historyRecords.first?.speakers?.names.map(\.displayName), ["Anna"])
+        XCTAssertEqual(
+            mac.appliedMutations.suffix(2).map { mutation -> String in
+                switch mutation {
+                case .upsertHistoryTranscript: "transcript"
+                case .upsertHistorySpeakers: "speakers"
+                default: "other"
+                }
+            },
+            ["transcript", "speakers"]
+        )
+        let idle = try await sync(phone, &phoneState, at: 35)
+        XCTAssertEqual(idle.operationsWritten, 0)
+
+        // Renaming on the Mac uploads the names only; the transcript is not written again.
+        let received = try XCTUnwrap(mac.historyRecords.first)
+        var renamed = SpeakerNameTable(transcriptRevision: transcript.revision)
+        renamed.setName("Anna Schmidt", for: "S1")
+        renamed.setName("Marco", for: "S2")
+        mac.historyRecords = [UserDataSyncHistoryRecord(
+            content: received.content,
+            inbox: received.inbox,
+            audio: nil,
+            transcript: received.transcript,
+            speakers: UserDataSyncHistorySpeakersV1(
+                recordID: recordID,
+                updatedAt: Self.date(40),
+                transcriptRevision: transcript.revision,
+                table: renamed
+            ),
+            localAudioFileURL: nil,
+            audioEligible: false
+        )]
+        let renameExport = try await sync(mac, &macState, at: 50)
+        let renameImport = try await sync(phone, &phoneState, at: 60)
+
+        XCTAssertEqual(renameExport.operationsWritten, 1)
+        XCTAssertEqual(renameImport.mutationsApplied, 1)
+        XCTAssertEqual(phone.historyRecords.first?.speakers?.names.map(\.displayName), ["Anna Schmidt", "Marco"])
+        XCTAssertEqual(phone.historyRecords.first?.transcript, transcript)
+
+        // An older rename from another device loses against the newer one.
+        let staleDirectory = CloudFolderSyncEngine.packageURL(for: folder)
+            .appendingPathComponent("ops/old-device", isDirectory: true)
+        try FileManager.default.createDirectory(at: staleDirectory, withIntermediateDirectories: true)
+        var stale = SpeakerNameTable(transcriptRevision: transcript.revision)
+        stale.setName("Stale", for: "S1")
+        let staleOperation = CloudFolderSyncOperation.upsertHistory(
+            itemID: UserDataSyncIdentity.historyItemID(recordID: recordID),
+            component: .speakers,
+            generation: phoneState.historyGeneration,
+            deviceId: "old-device",
+            speakers: UserDataSyncHistorySpeakersV1(
+                recordID: recordID,
+                updatedAt: Self.date(39),
+                transcriptRevision: transcript.revision,
+                table: stale
+            )
+        )
+        try Self.entitlementEncoder.encode(staleOperation)
+            .write(to: staleDirectory.appendingPathComponent("stale.json"))
+        let staleImport = try await sync(phone, &phoneState, at: 70)
+        XCTAssertEqual(staleImport.mutationsApplied, 0)
+        XCTAssertEqual(phone.historyRecords.first?.speakers?.names.map(\.displayName), ["Anna Schmidt", "Marco"])
+
+        // Deleting the record removes it with all of its components.
+        mac.historyRecords = []
+        mac.deletedHistoryRecords = [UserDataSyncHistoryDeletion(recordID: recordID, deletedAt: Self.date(80))]
+        _ = try await sync(mac, &macState, at: 90)
+        _ = try await sync(phone, &phoneState, at: 100)
+        XCTAssertTrue(phone.historyRecords.isEmpty)
+    }
+
+    @MainActor
+    func testSpeakerComponentsWaitUntilEveryRecentDeviceUnderstandsThem() async throws {
+        let folder = try TestSupport.makeTemporaryDirectory(prefix: "CloudFolderSyncSpeakerGate")
+        defer { TestSupport.remove(folder) }
+
+        let recordID = UUID(uuidString: "83600000-0000-4000-8000-0000000000A2")!
+        let transcript = UserDataSyncHistoryTranscriptV1(
+            recordID: recordID,
+            updatedAt: Self.date(10),
+            transcript: SpeakerTranscript(source: .localDiarizer, segments: [
+                SpeakerTranscriptSegment(text: "Good morning.", start: 0, end: 1, speakerID: "S1"),
+            ])
+        )
+        var table = SpeakerNameTable(transcriptRevision: transcript.revision)
+        table.setName("Anna", for: "S1")
+        let base = Self.historyRecord(
+            recordID: recordID,
+            finalText: "Good morning.",
+            contentUpdatedAt: Self.date(10),
+            inboxState: "none",
+            inboxUpdatedAt: Self.date(10)
+        )
+        let mac = InMemoryUserDataSyncStore(historyRecords: [UserDataSyncHistoryRecord(
+            content: base.content,
+            inbox: base.inbox,
+            audio: nil,
+            transcript: transcript,
+            speakers: UserDataSyncHistorySpeakersV1(
+                recordID: recordID,
+                updatedAt: Self.date(11),
+                transcriptRevision: transcript.revision,
+                table: table
+            ),
+            localAudioFileURL: nil,
+            audioEligible: false
+        )])
+        var macState = CloudFolderSyncState(deviceId: "mac-main")
+        let devicesURL = CloudFolderSyncEngine.packageURL(for: folder)
+            .appendingPathComponent("devices", isDirectory: true)
+        try FileManager.default.createDirectory(at: devicesURL, withIntermediateDirectories: true)
+        func writePhone(capabilities: [String]?, updatedAt: Date) throws {
+            try Self.entitlementEncoder.encode(CloudFolderSyncDeviceRecord(
+                deviceId: "ios-phone",
+                platform: "iOS",
+                appVersion: "1.1.0",
+                updatedAt: updatedAt,
+                capabilities: capabilities
+            )).write(to: devicesURL.appendingPathComponent("ios-phone.json"))
+        }
+        func syncMac(at seconds: TimeInterval) async throws -> CloudFolderSyncResult {
+            try await CloudFolderSyncEngine.sync(
+                folderURL: folder,
+                store: mac,
+                state: &macState,
+                entitlements: PaidEntitlements(canUseCloudFolderSync: true),
+                now: Self.date(seconds)
+            )
+        }
+
+        // A phone without the capability synced recently: only content and inbox are written.
+        try writePhone(capabilities: nil, updatedAt: Self.date(15))
+        let withheld = try await syncMac(at: 20)
+        XCTAssertEqual(withheld.operationsWritten, 2)
+        let again = try await syncMac(at: 30)
+        XCTAssertEqual(again.operationsWritten, 0)
+
+        // An edit of the same record's text from the phone does not count as
+        // receiving the held-back components.
+        let phoneOperations = CloudFolderSyncEngine.packageURL(for: folder)
+            .appendingPathComponent("ops/ios-phone", isDirectory: true)
+        try FileManager.default.createDirectory(at: phoneOperations, withIntermediateDirectories: true)
+        let edited = Self.historyRecord(
+            recordID: recordID,
+            finalText: "Good morning, Anna.",
+            contentUpdatedAt: Self.date(31),
+            inboxState: "none",
+            inboxUpdatedAt: Self.date(10)
+        )
+        try Self.entitlementEncoder.encode(CloudFolderSyncOperation.upsertHistory(
+            itemID: UserDataSyncIdentity.historyItemID(recordID: recordID),
+            component: .content,
+            generation: macState.historyGeneration,
+            deviceId: "ios-phone",
+            content: edited.content
+        )).write(to: phoneOperations.appendingPathComponent("edit.json"))
+        let phoneEdit = try await syncMac(at: 33)
+        XCTAssertEqual(phoneEdit.mutationsApplied, 1)
+
+        // After the phone's update the pending components are uploaded.
+        try writePhone(capabilities: [CloudFolderSyncDeviceRecord.speakerTranscriptCapability], updatedAt: Self.date(35))
+        let released = try await syncMac(at: 40)
+        XCTAssertEqual(released.operationsWritten, 2)
+
+        XCTAssertTrue(CloudFolderSyncEngine.speakerComponentsCanBeWritten(devices: [], ownDeviceId: "mac-main", now: Self.date(0)))
+        let stalePhone = CloudFolderSyncDeviceRecord(deviceId: "old", platform: "iOS", appVersion: "1.0", updatedAt: Self.date(0))
+        XCTAssertFalse(CloudFolderSyncEngine.speakerComponentsCanBeWritten(
+            devices: [stalePhone],
+            ownDeviceId: "mac-main",
+            now: Self.date(29 * 24 * 60 * 60)
+        ))
+        XCTAssertTrue(CloudFolderSyncEngine.speakerComponentsCanBeWritten(
+            devices: [stalePhone],
+            ownDeviceId: "mac-main",
+            now: Self.date(31 * 24 * 60 * 60)
+        ))
     }
 
     @MainActor
@@ -3622,6 +4411,40 @@ final class CloudFolderSyncTests: XCTestCase {
 
     private static func date(_ seconds: TimeInterval) -> Date {
         Date(timeIntervalSince1970: 1_700_000_000 + seconds)
+    }
+
+    private static func makeBridgeRoots() throws -> (local: URL, remote: URL) {
+        (
+            try TestSupport.makeTemporaryDirectory(prefix: "ICloudBridgeLocal"),
+            try TestSupport.makeTemporaryDirectory(prefix: "ICloudBridgeRemote")
+        )
+    }
+
+    private static func bridgeFileURL(_ path: String, in root: URL) -> URL {
+        root.appendingPathComponent("typewhisper-sync", isDirectory: true)
+            .appendingPathComponent(path)
+    }
+
+    private static func bridgeFileExists(_ path: String, in root: URL) -> Bool {
+        FileManager.default.fileExists(atPath: bridgeFileURL(path, in: root).path)
+    }
+
+    private static func writeBridgeFile(
+        _ path: String,
+        in root: URL,
+        contents: String? = nil,
+        seconds: TimeInterval
+    ) throws {
+        let file = bridgeFileURL(path, in: root)
+        try FileManager.default.createDirectory(
+            at: file.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data((contents ?? path).utf8).write(to: file)
+        try FileManager.default.setAttributes(
+            [.modificationDate: date(seconds)],
+            ofItemAtPath: file.path
+        )
     }
 
     private static func signedEntitlement(

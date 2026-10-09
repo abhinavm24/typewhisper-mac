@@ -1,5 +1,7 @@
 import Foundation
+#if !APPSTORE
 import Sparkle
+#endif
 
 enum PersonalUpdateConfiguration {
     static func isConfigured(infoDictionary: [String: Any]? = Bundle.main.infoDictionary) -> Bool {
@@ -27,6 +29,7 @@ struct UpdateChecker {
     let checkForUpdates: () -> Void
     let resetUpdateCycleAfterSettingsChange: () -> Void
 
+    #if !APPSTORE
     static func sparkle(_ updater: SPUUpdater) -> UpdateChecker {
         let configured = PersonalUpdateConfiguration.isConfigured()
         return UpdateChecker(
@@ -41,6 +44,7 @@ struct UpdateChecker {
             }
         )
     }
+    #endif
 
     static var shared: UpdateChecker?
 }

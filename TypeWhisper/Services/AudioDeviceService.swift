@@ -348,6 +348,12 @@ final class AudioDeviceService: ObservableObject, @unchecked Sendable {
         return inputDevices.first(where: { $0.uid == selectedDeviceUID })
     }
 
+    /// Name of the macOS default input, which recording uses when no microphone is selected.
+    var systemDefaultInputDeviceName: String? {
+        guard let deviceID = defaultInputDeviceController.defaultInputDeviceID() else { return nil }
+        return inputDevices.first(where: { $0.deviceID == deviceID })?.name ?? Self.deviceName(for: deviceID)
+    }
+
     var selectedDeviceCompatibility: AudioInputDeviceCompatibility? {
         selectedDevice?.compatibility
     }
@@ -520,6 +526,33 @@ final class AudioDeviceService: ObservableObject, @unchecked Sendable {
 
     func clearInputDevicePriorityList() {
         setInputDevicePriorityList([])
+    }
+
+    /// Replaces the whole list in one step, as the HTTP API does when a script
+    /// applies or restores saved audio settings. Disconnected entries are kept.
+    func replaceInputDevicePriorityList(_ items: [AudioInputDevicePriorityItem]) {
+        setInputDevicePriorityList(items)
+    }
+
+    var systemDefaultInputDeviceUID: String? {
+        guard let deviceID = defaultInputDeviceController.defaultInputDeviceID() else { return nil }
+        return inputDevices.first(where: { $0.deviceID == deviceID })?.uid ?? Self.deviceUID(for: deviceID)
+    }
+
+    /// The input the next recording would capture from: the first available
+    /// priority entry, otherwise the macOS default input.
+    func activeRecordingInput() -> AudioInputDevicePriorityItem? {
+        let selection = resolvedRecordingInputSelection()
+        if let uid = selection.deviceUID {
+            return AudioInputDevicePriorityItem(uid: uid, name: selection.deviceName ?? uid)
+        }
+
+        guard let deviceID = selection.deviceID ?? defaultInputDeviceController.defaultInputDeviceID() else {
+            return nil
+        }
+        let listedDevice = inputDevices.first(where: { $0.deviceID == deviceID })
+        guard let uid = listedDevice?.uid ?? Self.deviceUID(for: deviceID) else { return nil }
+        return AudioInputDevicePriorityItem(uid: uid, name: listedDevice?.name ?? Self.deviceName(for: deviceID) ?? uid)
     }
 
     func selectInputDeviceAsPrimary(_ uid: String) {
@@ -1598,6 +1631,16 @@ final class AudioDeviceService: ObservableObject, @unchecked Sendable {
         transportResolver.transportType(for: deviceID)
     }
 
+    /// Transport name of the device a recording uses: the resolved device, or the system
+    /// default input when none is selected. Reported with dictation latency measurements.
+    func recordingInputTransportName(for selection: ResolvedRecordingInputSelection) -> String? {
+        guard let deviceID = selection.deviceID ?? defaultInputDeviceController.defaultInputDeviceID(),
+              let transport = transportType(for: deviceID) else {
+            return nil
+        }
+        return Self.transportTypeName(transport)
+    }
+
     static func isBluetoothTransportType(_ transportType: UInt32) -> Bool {
         transportType == kAudioDeviceTransportTypeBluetooth
             || transportType == kAudioDeviceTransportTypeBluetoothLE
@@ -1701,7 +1744,7 @@ final class AudioDeviceService: ObservableObject, @unchecked Sendable {
             || transportType == kAudioDeviceTransportTypeAutoAggregate
     }
 
-    private static func transportTypeName(_ transportType: UInt32) -> String {
+    static func transportTypeName(_ transportType: UInt32) -> String {
         switch transportType {
         case kAudioDeviceTransportTypeBuiltIn:
             return "builtIn"

@@ -136,6 +136,14 @@ enum TranscriptionEngineReadiness {
         defaults.object(forKey: "plugin.\(pluginId).loadedModel") != nil
     }
 
+    /// The model ID local plugins persist after a successful load and restore from.
+    static func persistedRestorableModelId(
+        pluginId: String,
+        defaults: UserDefaults = .standard
+    ) -> String? {
+        defaults.string(forKey: "plugin.\(pluginId).loadedModel")
+    }
+
     /// A selected engine is actionable when authentication is available and it
     /// is already configured, can restore persisted model state, or has a
     /// provider-specific preparation fallback such as Apple Speech's catalog.
@@ -215,6 +223,9 @@ final class ModelManagerService: ObservableObject {
     }
 
     @Published private(set) var selectedProviderId: String?
+    /// True while the dictation engine is still loading its model during a recording or
+    /// its transcription, so the indicator can say why nothing happens yet.
+    @Published private(set) var isDictationModelLoading = false
 
     @Published var autoUnloadSeconds: Int {
         didSet {
@@ -232,15 +243,20 @@ final class ModelManagerService: ObservableObject {
     private var pluginConfiguredWaitAttempts = 300
     private var pluginRestoreBusyWaitAttempts = 5_700
     private var pluginConfiguredPollInterval: Duration = .milliseconds(100)
+    /// A warm model loads in well under a second; reporting that would only flash a label.
+    private var dictationModelLoadingRevealDelay: Duration = .milliseconds(750)
 
     private var passiveRestoreSelection: (providerId: String, instance: ObjectIdentifier)?
     private var dictationPrewarm: (key: ObjectIdentifier, plugin: any TranscriptionEnginePlugin)?
+    private var dictationModelLoadMonitor: Task<Void, Never>?
     private let providerKey = UserDefaultsKeys.selectedEngine
     private let modelKey = UserDefaultsKeys.selectedModelId
 
     init() {
         self.autoUnloadSeconds = ModelAutoUnloadPolicy.effectiveSeconds()
         self.selectedProviderId = UserDefaults.standard.string(forKey: providerKey)
+        // A temporary fallback belongs to the session that chose it.
+        PluginManager.temporaryFallbackEngine.withLock { $0 = nil }
     }
 
     #if DEBUG
@@ -253,12 +269,21 @@ final class ModelManagerService: ObservableObject {
         pluginRestoreBusyWaitAttempts = max(0, busyAttempts)
         pluginConfiguredPollInterval = pollInterval
     }
+
+    func setDictationModelLoadingRevealDelayForTesting(_ delay: Duration) {
+        dictationModelLoadingRevealDelay = delay
+    }
     #endif
 
     // MARK: - Public API
 
     var isModelReady: Bool {
-        guard let providerId = selectedProviderId else { return false }
+        isTranscriptionEngineReady(engineOverrideId: nil)
+    }
+
+    /// Whether the engine a dictation uses is ready without restoring its model first.
+    func isTranscriptionEngineReady(engineOverrideId: String?) -> Bool {
+        guard let providerId = engineOverrideId ?? selectedProviderId else { return false }
         return PluginManager.shared.transcriptionEngine(for: providerId)?.isConfigured ?? false
     }
 
@@ -329,12 +354,14 @@ final class ModelManagerService: ObservableObject {
     }
 
     func selectProvider(_ providerId: String) {
+        PluginManager.temporaryFallbackEngine.withLock { $0 = nil }
         selectedProviderId = providerId
         UserDefaults.standard.set(providerId, forKey: providerKey)
         reconcilePassiveModelRestore()
     }
 
     func clearProviderSelection() {
+        PluginManager.temporaryFallbackEngine.withLock { $0 = nil }
         selectedProviderId = nil
         UserDefaults.standard.removeObject(forKey: providerKey)
         passiveRestoreSelection = nil
@@ -343,6 +370,13 @@ final class ModelManagerService: ObservableObject {
     func selectModel(_ providerId: String, modelId: String) {
         selectProvider(providerId)
         PluginManager.shared.transcriptionEngine(for: providerId)?.selectModel(modelId)
+    }
+
+    /// Picks a model for an engine without making that engine the saved
+    /// choice, for the engine that is in use, which may be a temporary fallback.
+    func selectModel(_ modelId: String, of providerId: String) {
+        PluginManager.shared.transcriptionEngine(for: providerId)?.selectModel(modelId)
+        objectWillChange.send()
     }
 
     func loadModel(_ providerId: String, modelId: String) async throws {
@@ -568,21 +602,46 @@ final class ModelManagerService: ObservableObject {
 
     /// Re-validate provider selection after plugins have been loaded.
     /// If the selected plugin is missing, fall back to the first available engine.
+    /// Runs at launch and on every plugin manager change, including the moments
+    /// while a plugin is being installed or reloaded. A fallback chosen then only
+    /// lasts until the saved engine is usable again; it never replaces the saved
+    /// choice, which used to switch dictation to another engine for good (#1533).
     func restoreProviderSelection() {
         defer { reconcilePassiveModelRestore() }
-        if let providerId = selectedProviderId,
-           let engine = PluginManager.shared.transcriptionEngine(for: providerId),
-           canUseForTranscription(engine) {
+        let savedProviderId = UserDefaults.standard.string(forKey: providerKey)
+
+        if let savedProviderId, isUsableForTranscription(savedProviderId) {
+            PluginManager.temporaryFallbackEngine.withLock { $0 = nil }
+            if selectedProviderId != savedProviderId {
+                selectedProviderId = savedProviderId
+            }
             return
         }
-        // Selected provider doesn't exist - find a fallback
-        if let fallback = PluginManager.shared.transcriptionEngines.first(where: { $0.isConfigured && canUseForTranscription($0) }) {
-            selectProvider(fallback.providerId)
-        } else if let anyEngine = PluginManager.shared.transcriptionEngines.first(where: { canUseForTranscription($0) }) {
-            selectProvider(anyEngine.providerId)
-        } else {
-            clearProviderSelection()
+        if let providerId = selectedProviderId, isUsableForTranscription(providerId) {
+            return
         }
+
+        let engines = PluginManager.shared.transcriptionEngines
+        let fallback = engines.first(where: { $0.isConfigured && canUseForTranscription($0) })
+            ?? engines.first(where: { canUseForTranscription($0) })
+        guard let fallback else {
+            PluginManager.temporaryFallbackEngine.withLock { $0 = nil }
+            selectedProviderId = nil
+            passiveRestoreSelection = nil
+            return
+        }
+
+        if savedProviderId == nil {
+            selectProvider(fallback.providerId)
+        } else {
+            PluginManager.temporaryFallbackEngine.withLock { $0 = fallback.providerId }
+            selectedProviderId = fallback.providerId
+        }
+    }
+
+    private func isUsableForTranscription(_ providerId: String) -> Bool {
+        guard let engine = PluginManager.shared.transcriptionEngine(for: providerId) else { return false }
+        return canUseForTranscription(engine)
     }
 
     /// Activation hydrates auth and profiles before selection can be reconciled.
@@ -901,18 +960,22 @@ final class ModelManagerService: ObservableObject {
             plugin: plugin
         )
 
-        let result = try await transcribeWithResolvedLanguageSelection(
-            plugin: plugin,
-            audio: audio,
-            languageSelection: runtimeSelection,
-            task: task,
-            prompt: prompt,
-            dictionaryTermHints: dictionaryTermHints
-        )
+        // Speaker detection for the API and watch folders needs the word times too.
+        let wordTimings = PluginWordTimingCollector()
+        let result = try await PluginWordTimings.$collector.withValue(wordTimings) {
+            try await transcribeWithResolvedLanguageSelection(
+                plugin: plugin,
+                audio: audio,
+                languageSelection: runtimeSelection,
+                task: task,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints
+            )
+        }
 
         let processingTime = CFAbsoluteTimeGetCurrent() - startTime
 
-        return TranscriptionNormalizationService.normalizeResult(
+        var normalized = TranscriptionNormalizationService.normalizeResult(
             text: result.text,
             detectedLanguage: result.detectedLanguage,
             configuredLanguage: runtimeSelection.requestedLanguage,
@@ -924,6 +987,10 @@ final class ModelManagerService: ObservableObject {
             task: task,
             normalizeNumbers: normalizeNumbers
         )
+        normalized.words = wordTimings.words.map {
+            TranscriptionWord(text: $0.text, start: $0.start, end: $0.end)
+        }
+        return normalized
     }
 
     func transcribe(
@@ -1055,20 +1122,23 @@ final class ModelManagerService: ObservableObject {
             plugin: plugin
         )
 
-        let result = try await transcribeWithResolvedLanguageSelection(
-            plugin: plugin,
-            audio: audio,
-            languageSelection: runtimeSelection,
-            task: task,
-            prompt: prompt,
-            dictionaryTermHints: dictionaryTermHints,
-            onProgress: onProgress,
-            onSourceProgress: onSourceProgress
-        )
+        let wordTimings = PluginWordTimingCollector()
+        let result = try await PluginWordTimings.$collector.withValue(wordTimings) {
+            try await transcribeWithResolvedLanguageSelection(
+                plugin: plugin,
+                audio: audio,
+                languageSelection: runtimeSelection,
+                task: task,
+                prompt: prompt,
+                dictionaryTermHints: dictionaryTermHints,
+                onProgress: onProgress,
+                onSourceProgress: onSourceProgress
+            )
+        }
 
         let processingTime = CFAbsoluteTimeGetCurrent() - startTime
 
-        return TranscriptionNormalizationService.normalizeResult(
+        var normalized = TranscriptionNormalizationService.normalizeResult(
             text: result.text,
             detectedLanguage: result.detectedLanguage,
             configuredLanguage: runtimeSelection.requestedLanguage,
@@ -1080,6 +1150,10 @@ final class ModelManagerService: ObservableObject {
             task: task,
             normalizeNumbers: normalizeNumbers
         )
+        normalized.words = wordTimings.words.map {
+            TranscriptionWord(text: $0.text, start: $0.start, end: $0.end)
+        }
+        return normalized
     }
 
     // MARK: - Dictation Prewarm
@@ -1104,22 +1178,63 @@ final class ModelManagerService: ObservableObject {
         // A model override goes through selectModel() at transcription time, and Apple
         // Speech prepares per language; both keep their existing on-demand path.
         let restoreSelector = NSSelectorFromString("triggerRestoreModel")
-        guard cloudModelOverride == nil,
-              plugin.providerId != AppleSpeechModelSelection.providerId,
-              !plugin.isConfigured,
-              canPrepareForTranscription(plugin),
-              pluginSettingsActivity(plugin) == nil,
-              nsPlugin.responds(to: restoreSelector) else {
-            return
+        if cloudModelOverride == nil,
+           plugin.providerId != AppleSpeechModelSelection.providerId,
+           !plugin.isConfigured,
+           canPrepareForTranscription(plugin),
+           pluginSettingsActivity(plugin) == nil,
+           nsPlugin.responds(to: restoreSelector) {
+            _ = nsPlugin.perform(restoreSelector)
         }
 
-        _ = nsPlugin.perform(restoreSelector)
+        monitorDictationModelLoad(of: plugin, key: key, followsModelOverride: cloudModelOverride != nil)
     }
 
     func endDictationModelPrewarm() {
+        dictationModelLoadMonitor?.cancel()
+        dictationModelLoadMonitor = nil
+        isDictationModelLoading = false
         guard let prewarm = dictationPrewarm else { return }
         dictationPrewarm = nil
         endAutoUnloadProtectedUse(of: prewarm.plugin)
+    }
+
+    /// Follows the protected engine until its model is ready. A load can start with the
+    /// prewarm above or later with the transcription, and plugins only report it through
+    /// their settings activity, which has no change notification. Loads that finish within
+    /// the reveal delay are never reported. A model override switches models at transcription
+    /// time while the engine still reports the previous model as configured, so its monitor
+    /// follows the whole session.
+    private func monitorDictationModelLoad(
+        of plugin: any TranscriptionEnginePlugin,
+        key: ObjectIdentifier,
+        followsModelOverride: Bool
+    ) {
+        guard followsModelOverride || !plugin.isConfigured else { return }
+        dictationModelLoadMonitor = Task { @MainActor [weak self] in
+            var loadingSince: ContinuousClock.Instant?
+            while !Task.isCancelled {
+                guard let self, self.dictationPrewarm?.key == key else { return }
+                if self.isDictationPrewarmInFlight(for: plugin)
+                    && (followsModelOverride || !plugin.isConfigured) {
+                    loadingSince = loadingSince ?? .now
+                } else {
+                    loadingSince = nil
+                }
+                let isLoading = loadingSince.map {
+                    ContinuousClock.now - $0 >= self.dictationModelLoadingRevealDelay
+                } ?? false
+                if self.isDictationModelLoading != isLoading {
+                    self.isDictationModelLoading = isLoading
+                }
+                if plugin.isConfigured && !followsModelOverride { return }
+                do {
+                    try await Task.sleep(for: self.pluginConfiguredPollInterval)
+                } catch {
+                    return
+                }
+            }
+        }
     }
 
     /// True while a restore for the protected engine is visibly running, so the
