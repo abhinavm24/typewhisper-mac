@@ -286,11 +286,17 @@ final class WorkflowVoiceEditingTests: XCTestCase {
     }
     func testHostStopInvalidatesPreparedBluetoothInputEvenWhenNoRecordingIsActive() async throws {
         let recorder = AudioRecordingService()
-        recorder.testingSetPreparedBluetoothInput(AVAudioEngine(), deviceID: 123)
+        let preparedEngine = AVAudioEngine()
+        var tornDownEngines: [AVAudioEngine] = []
+        // Fake prepared inputs must not open real CoreAudio devices during teardown.
+        recorder.engineTeardownOverride = { tornDownEngines.append($0) }
+        recorder.testingSetPreparedBluetoothInput(preparedEngine, deviceID: 123)
         XCTAssertTrue(recorder.testingHasPreparedBluetoothInput())
         _ = await WorkflowVoiceEditingCoordinator.stopRecorder(recorder)
         XCTAssertEqual(recorder.testingLastBluetoothStopBehavior, .release)
         XCTAssertFalse(recorder.testingHasPreparedBluetoothInput())
+        XCTAssertEqual(tornDownEngines.count, 1)
+        XCTAssertTrue(tornDownEngines.first === preparedEngine)
     }
 
     func testVoiceWorkflowDraftAcceptsSpokenOnlyPromptAndRejectsAutomaticInsertion() throws {
