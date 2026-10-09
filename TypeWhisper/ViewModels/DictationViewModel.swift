@@ -2500,7 +2500,7 @@ final class DictationViewModel: ObservableObject {
     }
 
     private var shouldTrackTargetAppCorrectionLearning: Bool {
-        (licenseService?.hasCommercialLicense ?? false) &&
+        (licenseService?.canUseCorrectionLearning ?? LocalFeatureAccess.correctionLearning) &&
             UserDefaults.standard.bool(forKey: UserDefaultsKeys.targetAppCorrectionLearningEnabled)
     }
 
