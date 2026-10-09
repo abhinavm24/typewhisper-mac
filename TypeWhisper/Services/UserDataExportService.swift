@@ -51,6 +51,7 @@ struct UserDataLocations: Sendable {
                 PremiumICloudBridgeConstants.packageDirectoryName,
                 isDirectory: true
             ))
+            auxiliaryItems.append(PremiumICloudBridgeFileMirror.mirrorStateURL(localRoot: mirrorRoot))
         }
         auxiliaryItems += temporaryItems(withPrefix: temporaryItemPrefix, fileManager: fileManager)
 
@@ -119,11 +120,12 @@ enum UserDataExportService {
     static let settingsBackupFileName = "settings-backup.json"
     static let readmeFileName = "README.txt"
 
-    /// Top-level entries of the Application Support folder that are not user
-    /// data: installed plugin bundles, the marketplace cache, legacy model
-    /// downloads, and the local API port/token files.
+    /// Top-level entries of the Application Support folder that are not
+    /// exported: installed plugin bundles, the marketplace cache, legacy model
+    /// downloads, the local API port/token files, and voice profiles, which
+    /// are biometric data that stays on this Mac.
     static let excludedTopLevelNames: Set<String> = [
-        "Plugins", "MarketplaceCache", "models", "api-port", "api-discovery.json",
+        "Plugins", "MarketplaceCache", "models", "api-port", "api-discovery.json", "VoiceProfiles",
     ]
 
     /// Model download folders inside `PluginData/<pluginId>/`, compared
@@ -221,6 +223,26 @@ enum UserDataExportService {
         )
 
         let archive = workDirectory.appendingPathComponent("export.zip")
+        #if APPSTORE
+        // Sandboxed apps should not launch helper tools. Reading a directory
+        // for uploading yields a zip archive of it, including the folder itself.
+        var coordinationError: NSError?
+        var copyError: Error?
+        NSFileCoordinator().coordinate(
+            readingItemAt: root,
+            options: .forUploading,
+            error: &coordinationError
+        ) { zipURL in
+            do {
+                try fileManager.copyItem(at: zipURL, to: archive)
+            } catch {
+                copyError = error
+            }
+        }
+        if let error = coordinationError ?? copyError {
+            throw error
+        }
+        #else
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
         process.arguments = ["-c", "-k", "--sequesterRsrc", "--keepParent", root.path, archive.path]
@@ -229,6 +251,7 @@ enum UserDataExportService {
         guard process.terminationStatus == 0 else {
             throw ExportError.archiveFailed(process.terminationStatus)
         }
+        #endif
 
         if fileManager.fileExists(atPath: destination.path) {
             _ = try fileManager.replaceItemAt(destination, withItemAt: archive)

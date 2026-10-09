@@ -1,7 +1,14 @@
 enum LocalFeatureAccess {
+    #if APPSTORE
+    // Personal direct-distribution overrides must not alter StoreKit access.
+    static let correctionLearning = false
+    static let automaticTranscriptionFallback = false
+    static let customFolderSync = false
+    #else
     static let correctionLearning = true
     static let automaticTranscriptionFallback = true
     static let customFolderSync = true
+    #endif
 
     static func canUseCloudSync(
         mode: PremiumSyncMode,

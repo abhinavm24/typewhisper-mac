@@ -5,9 +5,12 @@ import SwiftUI
 import FluidAudio
 @_spi(FirstPartyPlugins) import TypeWhisperPluginSDK
 
-private actor AsyncTranscriptionGate {
+actor AsyncTranscriptionGate {
     private var isLocked = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    /// Callers queued behind the current holder.
+    var waitingCount: Int { waiters.count }
 
     func withLock<T: Sendable>(_ operation: @Sendable () async throws -> T) async throws -> T {
         await acquire()
@@ -40,7 +43,7 @@ private actor AsyncTranscriptionGate {
 // MARK: - Plugin Entry Point
 
 @objc(ParakeetPlugin)
-final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscriptionEnginePlugin, DictionaryTermsCapabilityProviding, TranscriptPreviewFallbackPolicyProviding, PluginSettingsActivityReporting, PassiveModelRestoreProviding, @unchecked Sendable {
+final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscriptionEnginePlugin, DictionaryTermsSettingEnabling, TranscriptPreviewFallbackPolicyProviding, PluginSettingsActivityReporting, PassiveModelRestoreProviding, @unchecked Sendable {
     static let pluginId = "com.typewhisper.parakeet"
     static let pluginName = "Parakeet"
     static let vocabularyAssetFileName = "parakeet_vocab.json"
@@ -70,7 +73,13 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
     fileprivate var vocabSizeConfig: ContextBiasingConstants.VocabSizeConfig?
     fileprivate var vocabularyBoostingEnabled: Bool = false
     private let transcriptionGate = AsyncTranscriptionGate()
+    /// Serializes every CTC model download, so file-only and in-memory downloads
+    /// never overlap or overwrite each other's state.
+    let ctcDownloadGate = AsyncTranscriptionGate()
     var ctcModelState: CtcModelState = .notDownloaded
+    /// Test hook replacing the CTC download I/O while keeping `ctcDownloadGate`.
+    /// Receives whether the model would also be loaded into memory.
+    var ctcModelDownloadOverrideForTests: (@Sendable (_ loadIntoMemory: Bool) async -> Void)?
     var lastConfiguredPrompt: String?
     var lastBoostingTermCount: Int = 0
 
@@ -175,6 +184,21 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
     var supportsTranslation: Bool { false }
     var dictionaryTermsSupport: DictionaryTermsSupport {
         vocabularyBoostingEnabled ? .supported : .requiresPluginSetting
+    }
+
+    var dictionaryTermsSettingSummary: String {
+        String(
+            localized: "Parakeet recognizes your terms better with Vocabulary Boosting (about 100 MB download).",
+            bundle: Bundle(for: ParakeetPlugin.self)
+        )
+    }
+
+    /// Turns on Vocabulary Boosting and fetches its CTC model, so the first dictation
+    /// after enabling does not wait for the download.
+    func enableDictionaryTermsSetting() async throws {
+        setBoostingEnabled(true)
+        try await prepareVocabularyBoostingModel()
+        host?.notifyCapabilitiesChanged()
     }
 
     var supportedLanguages: [String] {
@@ -300,7 +324,9 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
 
         let segments: [PluginTranscriptionSegment]
         if let tokenTimings = finalResult.tokenTimings, !tokenTimings.isEmpty {
-            segments = Self.groupTokensIntoSegments(tokenTimings)
+            let words = Self.groupTokensIntoWords(tokenTimings)
+            segments = Self.groupWordsIntoSegments(words)
+            PluginWordTimings.report(words)
         } else {
             segments = []
         }
@@ -343,15 +369,8 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
     }
     // MARK: - Token-to-Segment Grouping
 
-    private static func groupTokensIntoSegments(_ tokenTimings: [TokenTiming]) -> [PluginTranscriptionSegment] {
-        // Phase 1: Group sub-word tokens into words
-        struct WordTiming {
-            let word: String
-            let start: Double
-            let end: Double
-        }
-
-        var words: [WordTiming] = []
+    static func groupTokensIntoWords(_ tokenTimings: [TokenTiming]) -> [PluginWordTiming] {
+        var words: [PluginWordTiming] = []
         var currentWord = ""
         var wordStart: Double = 0
         var wordEnd: Double = 0
@@ -365,7 +384,7 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
             if startsNewWord && !currentWord.isEmpty {
                 let trimmed = currentWord.trimmingCharacters(in: .whitespaces)
                 if !trimmed.isEmpty {
-                    words.append(WordTiming(word: trimmed, start: wordStart, end: wordEnd))
+                    words.append(PluginWordTiming(text: trimmed, start: wordStart, end: wordEnd))
                 }
                 currentWord = ""
             }
@@ -381,12 +400,15 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
 
         let lastTrimmed = currentWord.trimmingCharacters(in: .whitespaces)
         if !lastTrimmed.isEmpty {
-            words.append(WordTiming(word: lastTrimmed, start: wordStart, end: wordEnd))
+            words.append(PluginWordTiming(text: lastTrimmed, start: wordStart, end: wordEnd))
         }
+        return words
+    }
 
+    /// Groups words into sentence segments (split at sentence-ending punctuation or pause > 0.8s).
+    static func groupWordsIntoSegments(_ words: [PluginWordTiming]) -> [PluginTranscriptionSegment] {
         guard !words.isEmpty else { return [] }
 
-        // Phase 2: Group words into sentence segments (split at sentence-ending punctuation or pause > 0.8s)
         let sentenceEndings: Set<Character> = [".", "?", "!"]
         let pauseThreshold: Double = 0.8
 
@@ -397,10 +419,10 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
 
         for i in 0..<words.count {
             let word = words[i]
-            segmentWords.append(word.word)
+            segmentWords.append(word.text)
             segmentEnd = word.end
 
-            let isSentenceEnd = word.word.last.map { sentenceEndings.contains($0) } ?? false
+            let isSentenceEnd = word.text.last.map { sentenceEndings.contains($0) } ?? false
             let hasLongPause = i + 1 < words.count && (words[i + 1].start - word.end) > pauseThreshold
             let isLast = i == words.count - 1
 
@@ -419,21 +441,59 @@ final class ParakeetPlugin: NSObject, DictionaryTermHintSourceProgressTranscript
 
     // MARK: - Vocabulary Boosting
 
-    fileprivate func downloadCtcModel() async {
+    /// Downloads and loads the CTC model, waiting for any CTC download in progress.
+    func downloadCtcModel() async {
+        _ = try? await ctcDownloadGate.withLock { [self] in
+            await performCtcModelDownload(loadIntoMemory: true)
+        }
+    }
+
+    /// Loads the CTC model when Parakeet is loaded. Otherwise only its files are
+    /// downloaded; the next model load picks them up without holding memory now.
+    /// A download already running from the settings view or a first transcription
+    /// finishes first, and the decision is made again afterwards.
+    func prepareVocabularyBoostingModel() async throws {
+        let state = try await ctcDownloadGate.withLock { [self] in
+            await performCtcModelDownload(loadIntoMemory: isConfigured)
+        }
+        if case .error(let message) = state {
+            throw ParakeetVocabularyBoostingError(message: message)
+        }
+    }
+
+    /// Call only while holding `ctcDownloadGate`. Returns the resulting state.
+    private func performCtcModelDownload(loadIntoMemory: Bool) async -> CtcModelState {
+        guard ctcModels == nil else { return ctcModelState }
+
+        if let ctcModelDownloadOverrideForTests {
+            await ctcModelDownloadOverrideForTests(loadIntoMemory)
+            return ctcModelState
+        }
+
         ctcModelState = .downloading
         do {
             applyHuggingFaceTokenToEnvironment()
             let spaceReservation = try await reserveCtcDownloadSpace()
             defer { spaceReservation?.release() }
-            let models = try await CtcModels.downloadAndLoad(variant: .ctc110m)
             let cacheDir = CtcModels.defaultCacheDirectory(for: .ctc110m)
-            let tokenizer = try await CtcTokenizer.load(from: cacheDir)
-            ctcModels = models
-            ctcTokenizer = tokenizer
-            ctcModelState = .ready
+            if loadIntoMemory {
+                let models = try await CtcModels.downloadAndLoad(variant: .ctc110m)
+                let tokenizer = try await CtcTokenizer.load(from: cacheDir)
+                ctcModels = models
+                ctcTokenizer = tokenizer
+                ctcModelState = .ready
+            } else {
+                try await CtcModels.download(variant: .ctc110m)
+                // Only the files are cached. Never replace a state another path
+                // set meanwhile, such as an unload resetting it.
+                if ctcModelState == .downloading {
+                    ctcModelState = .notDownloaded
+                }
+            }
         } catch {
             ctcModelState = .error(error.localizedDescription)
         }
+        return ctcModelState
     }
 
     static func vocabularyHints(
@@ -1144,6 +1204,12 @@ enum CtcModelState: Equatable {
     case downloading
     case ready
     case error(String)
+}
+
+struct ParakeetVocabularyBoostingError: LocalizedError, Equatable, Sendable {
+    let message: String
+
+    var errorDescription: String? { message }
 }
 
 private struct ParakeetVocabularyAssetHTTPError: LocalizedError, Sendable {

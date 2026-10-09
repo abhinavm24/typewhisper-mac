@@ -112,8 +112,10 @@ final class PremiumSettingsViewTests: XCTestCase {
         XCTAssertEqual(commercial.action(for: .calendarMeeting), .openSettings(.calendarMeeting))
         XCTAssertEqual(commercial.action(for: .correctionLearning), .openSettings(.correctionLearning))
         XCTAssertEqual(commercial.action(for: .cloudSync), .openSettings(.cloudSync))
+        XCTAssertEqual(commercial.action(for: .speakerWorkspace), .openSettings(.speakerWorkspace))
 
         let account = access(hasPremiumEntitlement: true, isSignedIn: true)
+        XCTAssertEqual(account.action(for: .speakerWorkspace), .openSettings(.speakerWorkspace))
         XCTAssertEqual(account.action(for: .calendarMeeting), .openSettings(.calendarMeeting))
         XCTAssertEqual(account.action(for: .correctionLearning), .openSettings(.correctionLearning))
         XCTAssertEqual(account.action(for: .cloudSync), .openSettings(.cloudSync))
@@ -152,6 +154,13 @@ final class PremiumSettingsViewTests: XCTestCase {
                             XCTAssertEqual(snapshot.action(for: .calendarMeeting), .none)
                             XCTAssertEqual(snapshot.action(for: .correctionLearning), .openSettings(.correctionLearning))
                             XCTAssertEqual(snapshot.action(for: .cloudSync), .openSettings(.cloudSync))
+                            XCTAssertEqual(snapshot.action(for: .speakerWorkspace), .none)
+                            XCTAssertEqual(
+                                snapshot.requirement(for: .speakerWorkspace),
+                                .commercialOrPremiumAccount
+                            )
+                        } else {
+                            XCTAssertEqual(snapshot.requirement(for: .speakerWorkspace), .available)
                         }
                     }
                 }
@@ -181,7 +190,11 @@ final class PremiumSettingsViewTests: XCTestCase {
             "calendarMeeting.settings.howItWorks",
             "calendarMeeting.settings.autoStop",
             "calendarMeeting.settings.autoStopHelp",
-            "calendarMeeting.settings.autoStopNotificationsRequired",
+            "calendarMeeting.settings.autoStopNotificationsOptional",
+            "calendarMeeting.settings.detectAdHoc",
+            "calendarMeeting.settings.detectAdHocHelp",
+            "calendarMeeting.settings.adHocAutoStopHelp",
+            "calendarMeeting.detected.titleFormat",
             "calendarMeeting.settings.notificationHelp",
             "calendarMeeting.settings.privacy",
             "calendarMeeting.settings.requestCalendarAccess",
@@ -251,6 +264,7 @@ final class PremiumSettingsViewTests: XCTestCase {
             "TypeWhisper/Services/SettingsBackupExporter.swift"
         ), encoding: .utf8)
         XCTAssertFalse(exporter.contains(UserDefaultsKeys.calendarMeetingStartMode))
+        XCTAssertFalse(exporter.contains(UserDefaultsKeys.calendarMeetingDetectAdHoc))
         XCTAssertFalse(exporter.contains(UserDefaultsKeys.calendarMeetingSelectedCalendarIDs))
         XCTAssertFalse(exporter.contains(UserDefaultsKeys.calendarMeetingSuppressedOccurrenceDigests))
         XCTAssertFalse(exporter.contains(UserDefaultsKeys.calendarMeetingReminderRequestDigests))

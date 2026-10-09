@@ -5,6 +5,7 @@ import Combine
 import CoreAudio
 import Foundation
 import os
+import Security
 import XCTest
 import TypeWhisperPluginSDK
 @testable import TypeWhisper
@@ -43,6 +44,29 @@ private final class APIFakeAudioInputDeviceDefaultController: AudioInputDeviceDe
 private final class IntegrationFakeAudioInputDeviceActivator: AudioInputDeviceActivating {
     func activate(deviceID: AudioDeviceID, reason: String) -> Bool { true }
     func restore(reason: String) {}
+}
+
+private final class IntegrationOutputVolumeController: AudioOutputVolumeControlling {
+    private let state = OSAllocatedUnfairLock(initialState: (volume: Float(0.75), writes: [Float]()))
+
+    var volume: Float {
+        get { state.withLock { $0.volume } }
+        set { state.withLock { $0.volume = newValue } }
+    }
+
+    var writes: [Float] { state.withLock { $0.writes } }
+
+    func defaultOutputSnapshot() -> AudioOutputVolumeSnapshot? {
+        AudioOutputVolumeSnapshot(deviceID: 1, deviceUID: "test-output", deviceName: "Test output", volume: volume)
+    }
+
+    func setVolume(_ volume: Float, for deviceID: AudioDeviceID) -> Bool {
+        state.withLock {
+            $0.volume = volume
+            $0.writes.append(volume)
+        }
+        return true
+    }
 }
 
 final class WavEncoderParityTests: XCTestCase {
@@ -997,7 +1021,10 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         private var createCount = 0
         private var appendCount = 0
         private var cancelCount = 0
+        private var batchSamples: [Float] = []
         var failsFinalization = false
+        /// Every audio append throws, like a live connection that dropped.
+        var failsAudioAppend = false
         /// Session creation takes this long and ignores cancellation, like a stalled provider.
         var sessionCreationStall: TimeInterval = 0
 
@@ -1013,6 +1040,10 @@ final class TypeWhisperIntegrationTests: XCTestCase {
             lock.withLock { cancelCount }
         }
 
+        var lastBatchTranscriptionSamples: [Float] {
+            lock.withLock { batchSamples }
+        }
+
         required override init() {}
 
         func activate(host: HostServices) {}
@@ -1020,7 +1051,8 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         func selectModel(_ modelId: String) {}
 
         func transcribe(audio: AudioData, language: String?, translate: Bool, prompt: String?) async throws -> PluginTranscriptionResult {
-            PluginTranscriptionResult(text: "batch", detectedLanguage: language)
+            lock.withLock { batchSamples = audio.samples }
+            return PluginTranscriptionResult(text: "batch", detectedLanguage: language)
         }
 
         func createLiveTranscriptionSession(
@@ -1034,7 +1066,11 @@ final class TypeWhisperIntegrationTests: XCTestCase {
             while Date() < stallEnd {
                 try? await Task.sleep(for: .milliseconds(20))
             }
-            return MockLiveSession(failsFinalization: failsFinalization, plugin: self)
+            return MockLiveSession(
+                failsFinalization: failsFinalization,
+                failsAudioAppend: failsAudioAppend,
+                plugin: self
+            )
         }
 
         fileprivate func recordAppend() {
@@ -1047,15 +1083,20 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
         private actor MockLiveSession: LiveTranscriptionSession {
             private let failsFinalization: Bool
+            private let failsAudioAppend: Bool
             private let plugin: MockLiveDictationPlugin
 
-            init(failsFinalization: Bool, plugin: MockLiveDictationPlugin) {
+            init(failsFinalization: Bool, failsAudioAppend: Bool, plugin: MockLiveDictationPlugin) {
                 self.failsFinalization = failsFinalization
+                self.failsAudioAppend = failsAudioAppend
                 self.plugin = plugin
             }
 
             func appendAudio(samples: [Float]) async throws {
                 plugin.recordAppend()
+                if failsAudioAppend {
+                    throw PluginTranscriptionError.networkError("Socket is not connected")
+                }
             }
 
             func finish() async throws -> PluginTranscriptionResult {
@@ -1797,6 +1838,8 @@ final class TypeWhisperIntegrationTests: XCTestCase {
             onDuck(factor)
         }
 
+        override func prepareDucking() {}
+
         override func restoreAudio() {
             onRestore()
         }
@@ -1964,7 +2007,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
     }
 
     func testRouterRequiresAPITokenForRegisteredRoutes() async throws {
-        let router = APIRouter(apiTokenProvider: { "test-token" })
+        let router = APIRouter(authenticationProvider: { .required(token: "test-token") })
         router.register("GET", "/v1/status") { _ in
             .json(["status": "ready"])
         }
@@ -2016,13 +2059,109 @@ final class TypeWhisperIntegrationTests: XCTestCase {
     func testLocalAPIAuthenticatorEnforcesTokenOnlyWhenEnabled() {
         let authenticator = LocalAPIAuthenticator(initialToken: "test-token", requiresAuthentication: false)
 
-        XCTAssertNil(authenticator.tokenForEnforcedRequests())
+        XCTAssertEqual(authenticator.authenticationRequirement(), .disabled)
 
         authenticator.setRequiresAuthentication(true)
-        XCTAssertEqual(authenticator.tokenForEnforcedRequests(), "test-token")
+        XCTAssertEqual(authenticator.authenticationRequirement(), .required(token: "test-token"))
 
         authenticator.setRequiresAuthentication(false)
-        XCTAssertNil(authenticator.tokenForEnforcedRequests())
+        XCTAssertEqual(authenticator.authenticationRequirement(), .disabled)
+    }
+
+    func testRouterRejectsProtectedRoutesWhileTheRequiredTokenIsMissing() async {
+        for missingToken in [nil, ""] as [String?] {
+            let router = APIRouter(authenticationProvider: { .required(token: missingToken) })
+            router.register("GET", "/v1/status") { _ in .json(["status": "ready"]) }
+            router.register("GET", "/v1/models") { _ in .json(["ok": true]) }
+
+            let status = await router.route(Self.apiRequest("/v1/status"))
+            let withoutToken = await router.route(Self.apiRequest("/v1/models"))
+            let withEmptyToken = await router.route(
+                Self.apiRequest("/v1/models", headers: ["authorization": "Bearer "])
+            )
+            let withSomeToken = await router.route(
+                Self.apiRequest("/v1/models", headers: ["x-typewhisper-api-token": "guess"])
+            )
+
+            XCTAssertEqual(status.status, 200)
+            XCTAssertEqual(withoutToken.status, 401)
+            XCTAssertEqual(withEmptyToken.status, 401)
+            XCTAssertEqual(withSomeToken.status, 401)
+        }
+    }
+
+    func testRouterAcceptsLocalToolsAndRejectsForeignWebPages() async {
+        let router = APIRouter()
+        router.register("GET", "/v1/status") { _ in .json(["status": "ready"]) }
+        router.register("POST", "/v1/dictation/start") { _ in .json(["ok": true]) }
+
+        let accepted: [[String: String]] = [
+            [:],
+            ["host": "127.0.0.1:8978"],
+            ["host": "localhost:8978"],
+            ["host": "LOCALHOST"],
+            ["host": "[::1]:8978"],
+            ["host": "127.0.0.1:8978", "origin": "http://localhost:3000", "sec-fetch-site": "same-site"],
+            ["host": "127.0.0.1:8978", "origin": "http://localhost:3000", "sec-fetch-site": "cross-site"],
+            ["host": "127.0.0.1:8978", "origin": "http://[::1]:5173"],
+            ["host": "127.0.0.1:8978", "origin": "chrome-extension://abcdefghijklmnop"],
+            ["host": "127.0.0.1:8978", "sec-fetch-site": "none"],
+        ]
+        let rejected: [[String: String]] = [
+            ["host": "attacker.example:8978"],
+            ["host": "127.0.0.1.attacker.example"],
+            ["host": ""],
+            ["host": "127.0.0.1:8978", "origin": "https://attacker.example"],
+            ["host": "127.0.0.1:8978", "origin": "http://localhost.attacker.example"],
+            ["host": "127.0.0.1:8978", "origin": "null"],
+            ["host": "127.0.0.1:8978", "sec-fetch-site": "cross-site"],
+            ["host": "127.0.0.1:8978", "origin": "chrome-extension://abcdefghijklmnop", "sec-fetch-site": "cross-site"],
+        ]
+
+        for headers in accepted {
+            let status = await router.route(Self.apiRequest("/v1/status", headers: headers)).status
+            let start = await router.route(Self.apiRequest("/v1/dictation/start", method: "POST", headers: headers)).status
+            XCTAssertEqual(status, 200, "\(headers)")
+            XCTAssertEqual(start, 200, "\(headers)")
+        }
+
+        for headers in rejected {
+            let status = await router.route(Self.apiRequest("/v1/status", headers: headers)).status
+            let start = await router.route(Self.apiRequest("/v1/dictation/start", method: "POST", headers: headers)).status
+            let preflight = await router.route(Self.apiRequest("/v1/dictation/start", method: "OPTIONS", headers: headers)).status
+            XCTAssertEqual(status, 403, "\(headers)")
+            XCTAssertEqual(start, 403, "\(headers)")
+            XCTAssertEqual(preflight, 403, "\(headers)")
+        }
+    }
+
+    func testAPITokenIsRequiredByDefaultButExistingTokenlessServersKeepRunning() throws {
+        let freshDefaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        XCTAssertTrue(LocalAPIAuthenticator.storedRequiresAuthentication(freshDefaults))
+        freshDefaults.set(true, forKey: UserDefaultsKeys.apiServerEnabled)
+        XCTAssertTrue(
+            LocalAPIAuthenticator.storedRequiresAuthentication(freshDefaults),
+            "Enabling the server later must not drop the token requirement"
+        )
+
+        let existingServerDefaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        existingServerDefaults.set(true, forKey: UserDefaultsKeys.apiServerEnabled)
+        XCTAssertFalse(LocalAPIAuthenticator.storedRequiresAuthentication(existingServerDefaults))
+        existingServerDefaults.set(false, forKey: UserDefaultsKeys.apiServerEnabled)
+        XCTAssertFalse(LocalAPIAuthenticator.storedRequiresAuthentication(existingServerDefaults))
+
+        let optedInDefaults = try XCTUnwrap(UserDefaults(suiteName: UUID().uuidString))
+        optedInDefaults.set(true, forKey: UserDefaultsKeys.apiServerEnabled)
+        optedInDefaults.set(true, forKey: UserDefaultsKeys.apiServerRequiresAuthentication)
+        XCTAssertTrue(LocalAPIAuthenticator.storedRequiresAuthentication(optedInDefaults))
+    }
+
+    private static func apiRequest(
+        _ path: String,
+        method: String = "GET",
+        headers: [String: String] = [:]
+    ) -> HTTPRequest {
+        HTTPRequest(method: method, path: path, queryParams: [:], headers: headers, body: Data())
     }
 
     func testLocalAPIAuthenticatorDefersKeychainReadOffMainThread() async throws {
@@ -2049,6 +2188,85 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
         XCTAssertFalse(responseText.contains("Access-Control-Allow-Origin: *"))
         XCTAssertFalse(responseText.contains("Access-Control-Allow-Headers: Content-Type"))
+    }
+
+    func testHistoryAPIListsSpeakersAndSegmentsOnRequest() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        context = try await MainActor.run { () -> APIContext in
+            let context = Self.makeAPIContext(appSupportDirectory: appSupportDirectory)
+            let id = UUID()
+            try SpeakerAudioWriter.writeAAC(
+                samples: [Float](repeating: 0, count: 16_000),
+                to: context.historyService.speakerAudioFileURL(forRecordID: id)
+            )
+            XCTAssertTrue(context.historyService.addSpeakerRecord(
+                id: id,
+                text: "Good morning. Morning.",
+                title: "Meeting",
+                source: .recorder,
+                durationSeconds: 2,
+                language: "en",
+                engineUsed: "test",
+                timedText: [],
+                granularity: .segment,
+                transcript: SpeakerTranscript(source: .localDiarizer, segments: [
+                    SpeakerTranscriptSegment(text: "Good morning.", start: 0, end: 1, speakerID: "S1"),
+                    SpeakerTranscriptSegment(text: "Morning.", start: 1, end: 2, speakerID: "S2"),
+                ])
+            ))
+            context.historyService.setSpeakerName("Anna", for: "S1", inRecordID: id)
+            // A name a voice profile only suggested is not returned as the speaker's name.
+            context.historyService.setSpeakerName("Guess", for: "S2", profileID: UUID(), isSuggestion: true, inRecordID: id)
+            context.historyService.addRecord(
+                rawText: "A dictation",
+                finalText: "A dictation",
+                appName: nil,
+                appBundleIdentifier: nil,
+                durationSeconds: 1,
+                language: "en",
+                engineUsed: "test"
+            )
+            return context
+        }
+        let router = try XCTUnwrap(context?.router)
+
+        let plain = try Self.jsonObject(
+            await router.route(HTTPRequest(method: "GET", path: "/v1/history", queryParams: [:], headers: [:], body: Data()))
+        )
+        let detailed = try Self.jsonObject(
+            await router.route(HTTPRequest(
+                method: "GET",
+                path: "/v1/history",
+                queryParams: ["include": "speaker_segments"],
+                headers: [:],
+                body: Data()
+            ))
+        )
+
+        let plainEntries = try XCTUnwrap(plain["entries"] as? [[String: Any]])
+        let meeting = try XCTUnwrap(plainEntries.first { $0["app_name"] as? String == "Meeting" })
+        let dictation = try XCTUnwrap(plainEntries.first { $0["text"] as? String == "A dictation" })
+        XCTAssertEqual(meeting["speaker_state"] as? String, "ready")
+        XCTAssertEqual(
+            meeting["speakers"] as? [[String: String]],
+            [["id": "S1", "name": "Anna"], ["id": "S2", "name": SpeakerTranscriptBuilder.outputLabel(for: "S2")]]
+        )
+        XCTAssertNil(meeting["speaker_segments"])
+        XCTAssertNil(dictation["speaker_state"])
+        XCTAssertNil(dictation["speakers"])
+
+        let detailedEntries = try XCTUnwrap(detailed["entries"] as? [[String: Any]])
+        let segments = try XCTUnwrap(
+            detailedEntries.first { $0["app_name"] as? String == "Meeting" }?["speaker_segments"] as? [[String: Any]]
+        )
+        XCTAssertEqual(segments.map { $0["speaker"] as? String }, ["S1", "S2"])
+        XCTAssertEqual(segments.map { $0["text"] as? String }, ["Good morning.", "Morning."])
     }
 
     func testAPIHandlersExposeStatusHistoryAndRules() async throws {
@@ -2201,9 +2419,40 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         )
         XCTAssertEqual(importResponse.status, 200)
         let importResult = try Self.jsonObject(importResponse)
-        XCTAssertEqual(importResult["workflowsImported"] as? Int, 1)
+        XCTAssertEqual(importResult["workflowsImported"] as? Int, 0)
+        XCTAssertEqual(importResult["workflowsSkipped"] as? Int, 1)
         let workflowCount = await MainActor.run { apiContext.workflowService.workflows.count }
-        XCTAssertEqual(workflowCount, 2)
+        XCTAssertEqual(workflowCount, 1)
+
+        var editedBackup = try XCTUnwrap(JSONSerialization.jsonObject(with: exportResponse.body) as? [String: Any])
+        var editedWorkflows = try XCTUnwrap(editedBackup["workflows"] as? [[String: Any]])
+        editedWorkflows[0]["template"] = "summary"
+        editedBackup["workflows"] = editedWorkflows
+        let replaceResponse = await router.route(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/settings/import",
+                queryParams: ["mode": "replace"],
+                headers: ["content-type": "application/json"],
+                body: try JSONSerialization.data(withJSONObject: editedBackup)
+            )
+        )
+        XCTAssertEqual(replaceResponse.status, 200)
+        let replaceResult = try Self.jsonObject(replaceResponse)
+        XCTAssertEqual(replaceResult["workflowsUpdated"] as? Int, 1)
+        let replacedTemplates = await MainActor.run { apiContext.workflowService.workflows.map(\.template) }
+        XCTAssertEqual(replacedTemplates, [.summary])
+
+        let invalidModeResponse = await router.route(
+            HTTPRequest(
+                method: "POST",
+                path: "/v1/settings/import",
+                queryParams: ["mode": "mirror"],
+                headers: ["content-type": "application/json"],
+                body: exportResponse.body
+            )
+        )
+        XCTAssertEqual(invalidModeResponse.status, 400)
 
         let invalidResponse = await router.route(
             HTTPRequest(
@@ -2220,6 +2469,350 @@ final class TypeWhisperIntegrationTests: XCTestCase {
             (invalidBody["error"] as? [String: Any])?["message"] as? String,
             "Request body is not a valid TypeWhisper settings backup"
         )
+    }
+
+    // MARK: - /v1/settings/audio
+
+    private static let audioSettingsDefaultsKeys = [
+        UserDefaultsKeys.inputDevicePriorityList,
+        UserDefaultsKeys.selectedInputDeviceUID,
+        UserDefaultsKeys.audioDuckingEnabled,
+        UserDefaultsKeys.audioDuckingLevel,
+        UserDefaultsKeys.mediaPauseEnabled,
+        UserDefaultsKeys.soundFeedbackEnabled,
+    ]
+
+    /// Fake devices: BlackHole, a USB microphone that is the macOS default input,
+    /// and a priority list whose first entry is not connected.
+    @MainActor
+    private static func makeAudioSettingsAPIContext(appSupportDirectory: URL) -> APIContext {
+        UserDefaults.standard.set(true, forKey: UserDefaultsKeys.audioDuckingEnabled)
+        UserDefaults.standard.set(0.2, forKey: UserDefaultsKeys.audioDuckingLevel)
+        UserDefaults.standard.set(false, forKey: UserDefaultsKeys.mediaPauseEnabled)
+        UserDefaults.standard.set(true, forKey: UserDefaultsKeys.soundFeedbackEnabled)
+
+        let context = makeAPIContext(
+            appSupportDirectory: appSupportDirectory,
+            audioDeviceTransportResolver: FakeAudioDeviceTransportResolver(transports: [:]),
+            audioDeviceDefaultInputController: APIFakeAudioInputDeviceDefaultController(defaultInputDeviceID: 70_702)
+        )
+        context.audioDeviceService.inputDevices = [
+            AudioInputDevice(deviceID: 70_701, name: "BlackHole 2ch", uid: "BlackHole2ch_UID"),
+            AudioInputDevice(deviceID: 70_702, name: "USB Microphone", uid: "usb-microphone-uid"),
+        ]
+        context.audioDeviceService.replaceInputDevicePriorityList([
+            AudioInputDevicePriorityItem(uid: "quadcast-uid", name: "HyperX QuadCast 2"),
+            AudioInputDevicePriorityItem(uid: "usb-microphone-uid", name: "USB Microphone"),
+        ])
+        return context
+    }
+
+    private static func audioSettingsPatch(_ body: String) -> HTTPRequest {
+        HTTPRequest(
+            method: "PATCH",
+            path: "/v1/settings/audio",
+            queryParams: [:],
+            headers: ["content-type": "application/json"],
+            body: Data(body.utf8)
+        )
+    }
+
+    private static let audioSettingsGet = HTTPRequest(
+        method: "GET",
+        path: "/v1/settings/audio",
+        queryParams: [:],
+        headers: [:],
+        body: Data()
+    )
+
+    func testAudioSettingsEndpointReportsDevicesPriorityAndActiveInput() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        let originalDefaults = Self.audioSettingsDefaultsKeys.map { UserDefaults.standard.object(forKey: $0) }
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+            for (key, value) in zip(Self.audioSettingsDefaultsKeys, originalDefaults) {
+                Self.restoreUserDefault(value, forKey: key)
+            }
+        }
+
+        context = await MainActor.run { Self.makeAudioSettingsAPIContext(appSupportDirectory: appSupportDirectory) }
+        let router = try XCTUnwrap(context).router
+
+        let response = await router.route(Self.audioSettingsGet)
+        XCTAssertEqual(response.status, 200)
+        XCTAssertEqual(response.contentType, "application/json")
+        let state = try Self.jsonObject(response)
+        XCTAssertEqual(
+            Set(state.keys),
+            [
+                "input_devices", "input_priority", "active_input", "audio_ducking_enabled",
+                "audio_ducking_level", "pause_media_during_recording", "sound_feedback_enabled",
+            ]
+        )
+        let devices = try XCTUnwrap(state["input_devices"] as? [[String: Any]])
+        XCTAssertEqual(devices.map { $0["id"] as? String }, ["BlackHole2ch_UID", "usb-microphone-uid"])
+        XCTAssertEqual(devices.map { $0["name"] as? String }, ["BlackHole 2ch", "USB Microphone"])
+        XCTAssertEqual(devices.map { $0["is_system_default"] as? Bool }, [false, true])
+        let priority = try XCTUnwrap(state["input_priority"] as? [[String: Any]])
+        XCTAssertEqual(priority.map { $0["id"] as? String }, ["quadcast-uid", "usb-microphone-uid"])
+        XCTAssertEqual(priority.map { $0["name"] as? String }, ["HyperX QuadCast 2", "USB Microphone"])
+        // The disconnected QuadCast is skipped.
+        XCTAssertEqual((state["active_input"] as? [String: Any])?["id"] as? String, "usb-microphone-uid")
+        XCTAssertEqual(state["audio_ducking_enabled"] as? Bool, true)
+        XCTAssertEqual(state["audio_ducking_level"] as? Double, 0.2)
+        XCTAssertEqual(state["pause_media_during_recording"] as? Bool, false)
+        XCTAssertEqual(state["sound_feedback_enabled"] as? Bool, true)
+
+        let blackHoleFirst = await router.route(Self.audioSettingsPatch(
+            #"{"input_priority":[{"id":"BlackHole2ch_UID","name":"BlackHole 2ch"}]}"#
+        ))
+        XCTAssertEqual(blackHoleFirst.status, 200)
+        let blackHoleState = try Self.jsonObject(blackHoleFirst)
+        XCTAssertEqual((blackHoleState["active_input"] as? [String: Any])?["id"] as? String, "BlackHole2ch_UID")
+        XCTAssertEqual((blackHoleState["active_input"] as? [String: Any])?["name"] as? String, "BlackHole 2ch")
+        let resolvedUID = await MainActor.run { context?.audioDeviceService.resolvedRecordingInputSelection().deviceUID }
+        XCTAssertEqual(resolvedUID, "BlackHole2ch_UID")
+
+        // An empty list means the macOS default input.
+        let systemDefault = await router.route(Self.audioSettingsPatch(#"{"input_priority":[]}"#))
+        XCTAssertEqual(systemDefault.status, 200)
+        let systemDefaultState = try Self.jsonObject(systemDefault)
+        XCTAssertEqual((systemDefaultState["input_priority"] as? [Any])?.count, 0)
+        XCTAssertEqual((systemDefaultState["active_input"] as? [String: Any])?["id"] as? String, "usb-microphone-uid")
+        XCTAssertNil(UserDefaults.standard.object(forKey: UserDefaultsKeys.inputDevicePriorityList))
+
+        // Without any input the key stays present as null.
+        await MainActor.run {
+            context?.audioDeviceService.inputDevices = []
+        }
+        let noInput = await router.route(Self.audioSettingsGet)
+        let noInputBody = try XCTUnwrap(String(data: noInput.body, encoding: .utf8))
+        XCTAssertTrue(noInputBody.contains(#""active_input":null"#), noInputBody)
+    }
+
+    func testAudioSettingsPatchRejectsUnknownFieldsAndInvalidValuesWithoutChangingAnything() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        let originalDefaults = Self.audioSettingsDefaultsKeys.map { UserDefaults.standard.object(forKey: $0) }
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+            for (key, value) in zip(Self.audioSettingsDefaultsKeys, originalDefaults) {
+                Self.restoreUserDefault(value, forKey: key)
+            }
+        }
+
+        context = await MainActor.run { Self.makeAudioSettingsAPIContext(appSupportDirectory: appSupportDirectory) }
+        let router = try XCTUnwrap(context).router
+        let before = await router.route(Self.audioSettingsGet).body
+
+        let invalidBodies: [(body: String, message: String)] = [
+            ("", "Request body must be a JSON object"),
+            ("[]", "Request body must be a JSON object"),
+            ("not json", "Request body must be a JSON object"),
+            (
+                #"{"audio_ducking_enabled":false,"noise_suppression":true}"#,
+                "Unknown field 'noise_suppression'. TypeWhisper for macOS accepts: input_priority, audio_ducking_enabled, audio_ducking_level, pause_media_during_recording, sound_feedback_enabled"
+            ),
+            (#"{"active_input":{"id":"BlackHole2ch_UID"}}"#, "'active_input' is read-only"),
+            (#"{"input_devices":[]}"#, "'input_devices' is read-only"),
+            (#"{"audio_ducking_enabled":1}"#, "'audio_ducking_enabled' must be true or false"),
+            (#"{"audio_ducking_enabled":"false"}"#, "'audio_ducking_enabled' must be true or false"),
+            (#"{"pause_media_during_recording":null}"#, "'pause_media_during_recording' must be true or false"),
+            (#"{"sound_feedback_enabled":0}"#, "'sound_feedback_enabled' must be true or false"),
+            (#"{"audio_ducking_level":true}"#, "'audio_ducking_level' must be a number from 0 to 1"),
+            (#"{"audio_ducking_level":"0.1"}"#, "'audio_ducking_level' must be a number from 0 to 1"),
+            (#"{"audio_ducking_level":-0.1}"#, "'audio_ducking_level' must be a number from 0 to 1"),
+            (#"{"audio_ducking_enabled":false,"audio_ducking_level":1.5}"#, "'audio_ducking_level' must be a number from 0 to 1"),
+            (#"{"input_priority":"BlackHole2ch_UID"}"#, #"'input_priority' must be an array of {"id", "name"} objects"#),
+            (#"{"input_priority":["BlackHole2ch_UID"]}"#, #"input_priority[0] must be an object with "id" and optional "name""#),
+            (#"{"input_priority":[{"name":"BlackHole 2ch"}]}"#, "input_priority[0].id must be a device ID string"),
+            (#"{"input_priority":[{"id":"  "}]}"#, "input_priority[0].id must not be empty"),
+            (#"{"input_priority":[{"id":"a"},{"id":"a"}]}"#, "input_priority lists 'a' more than once"),
+            (#"{"input_priority":[{"id":"a","is_system_default":true}]}"#, "Unknown field 'is_system_default' in input_priority[0]"),
+            (#"{"input_priority":[{"id":"a","name":5}]}"#, "input_priority[0].name must be a string"),
+        ]
+
+        for invalid in invalidBodies {
+            let response = await router.route(Self.audioSettingsPatch(invalid.body))
+            XCTAssertEqual(response.status, 400, invalid.body)
+            let error = try Self.jsonObject(response)["error"] as? [String: Any]
+            XCTAssertEqual(error?["code"] as? String, "bad_request", invalid.body)
+            XCTAssertEqual(error?["message"] as? String, invalid.message, invalid.body)
+        }
+
+        let after = await router.route(Self.audioSettingsGet).body
+        XCTAssertEqual(
+            try JSONSerialization.jsonObject(with: after) as? NSDictionary,
+            try JSONSerialization.jsonObject(with: before) as? NSDictionary
+        )
+        XCTAssertEqual(UserDefaults.standard.object(forKey: UserDefaultsKeys.audioDuckingEnabled) as? Bool, true)
+
+        // A name is optional; disconnected devices keep the ID as their name.
+        let withoutName = await router.route(Self.audioSettingsPatch(
+            #"{"input_priority":[{"id":"BlackHole2ch_UID"},{"id":"not-connected-uid"}]}"#
+        ))
+        XCTAssertEqual(withoutName.status, 200)
+        let priority = try Self.jsonObject(withoutName)["input_priority"] as? [[String: Any]]
+        XCTAssertEqual(priority?.map { $0["name"] as? String }, ["BlackHole 2ch", "not-connected-uid"])
+    }
+
+    func testAudioSettingsPatchReturnsConflictWhileRecordingOrProcessing() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        let originalDefaults = Self.audioSettingsDefaultsKeys.map { UserDefaults.standard.object(forKey: $0) }
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+            for (key, value) in zip(Self.audioSettingsDefaultsKeys, originalDefaults) {
+                Self.restoreUserDefault(value, forKey: key)
+            }
+        }
+
+        context = await MainActor.run { Self.makeAudioSettingsAPIContext(appSupportDirectory: appSupportDirectory) }
+        let apiContext = try XCTUnwrap(context)
+        let patch = Self.audioSettingsPatch(
+            #"{"input_priority":[{"id":"BlackHole2ch_UID"}],"audio_ducking_enabled":false}"#
+        )
+
+        let busyDictationStates: [DictationViewModel.State] = [
+            .recording, .processing, .inserting, .promptSelection("text"), .promptProcessing("Prompt"),
+        ]
+        for busyState in busyDictationStates {
+            await MainActor.run { apiContext.dictationViewModel.state = busyState }
+            let response = await apiContext.router.route(patch)
+            XCTAssertEqual(response.status, 409, "\(busyState)")
+            XCTAssertEqual(
+                (try Self.jsonObject(response)["error"] as? [String: Any])?["message"] as? String,
+                "Audio settings cannot change while TypeWhisper is recording or processing"
+            )
+        }
+
+        await MainActor.run {
+            apiContext.dictationViewModel.state = .idle
+            apiContext.audioRecorderViewModel.state = .recording
+        }
+        let recorderBusy = await apiContext.router.route(patch)
+        XCTAssertEqual(recorderBusy.status, 409)
+
+        // Reading stays possible during a recording.
+        let readWhileRecording = await apiContext.router.route(Self.audioSettingsGet)
+        XCTAssertEqual(readWhileRecording.status, 200)
+
+        let unchanged = await MainActor.run {
+            (
+                priority: apiContext.audioDeviceService.inputDevicePriorityList.map(\.uid),
+                ducking: apiContext.dictationViewModel.audioDuckingEnabled
+            )
+        }
+        XCTAssertEqual(unchanged.priority, ["quadcast-uid", "usb-microphone-uid"])
+        XCTAssertTrue(unchanged.ducking)
+
+        await MainActor.run {
+            apiContext.audioRecorderViewModel.state = .finalizing
+        }
+        let recorderFinalizing = await apiContext.router.route(patch)
+        XCTAssertEqual(recorderFinalizing.status, 409)
+
+        await MainActor.run {
+            apiContext.audioRecorderViewModel.state = .idle
+            apiContext.dictationViewModel.state = .error("Microphone unavailable")
+        }
+        let afterError = await apiContext.router.route(patch)
+        XCTAssertEqual(afterError.status, 200)
+    }
+
+    func testAudioSettingsPatchAppliesDemoSettingsAndRestoresSavedStateLosslessly() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        let originalDefaults = Self.audioSettingsDefaultsKeys.map { UserDefaults.standard.object(forKey: $0) }
+        var context: APIContext?
+        defer {
+            context = nil
+            TestSupport.remove(appSupportDirectory)
+            for (key, value) in zip(Self.audioSettingsDefaultsKeys, originalDefaults) {
+                Self.restoreUserDefault(value, forKey: key)
+            }
+        }
+
+        context = await MainActor.run { Self.makeAudioSettingsAPIContext(appSupportDirectory: appSupportDirectory) }
+        let apiContext = try XCTUnwrap(context)
+        let router = apiContext.router
+        await MainActor.run {
+            apiContext.dictationViewModel.audioDuckingLevel = 0.35
+            apiContext.dictationViewModel.mediaPauseEnabled = true
+        }
+
+        // 1. Remember the current state.
+        let saved = try Self.jsonObject(await router.route(Self.audioSettingsGet))
+        let savedPriorityDefaults = UserDefaults.standard.data(forKey: UserDefaultsKeys.inputDevicePriorityList)
+
+        // 2. Demo settings: BlackHole first, no ducking, no media pause, no sounds.
+        let demo = await router.route(Self.audioSettingsPatch("""
+            {"input_priority":[{"id":"BlackHole2ch_UID","name":"BlackHole 2ch"}],
+             "audio_ducking_enabled":false,"audio_ducking_level":0,
+             "pause_media_during_recording":false,"sound_feedback_enabled":false}
+            """))
+        XCTAssertEqual(demo.status, 200)
+        let demoState = try Self.jsonObject(demo)
+        XCTAssertEqual((demoState["active_input"] as? [String: Any])?["id"] as? String, "BlackHole2ch_UID")
+        XCTAssertEqual(demoState["audio_ducking_enabled"] as? Bool, false)
+        XCTAssertEqual(demoState["audio_ducking_level"] as? Double, 0)
+        XCTAssertEqual(demoState["pause_media_during_recording"] as? Bool, false)
+        XCTAssertEqual(demoState["sound_feedback_enabled"] as? Bool, false)
+
+        // The change goes through the same view model state the settings window binds to and is persisted.
+        let applied = await MainActor.run {
+            (
+                selectedUID: apiContext.audioDeviceService.selectedDeviceUID,
+                ducking: apiContext.dictationViewModel.audioDuckingEnabled,
+                mediaPause: apiContext.dictationViewModel.mediaPauseEnabled,
+                sound: apiContext.dictationViewModel.soundFeedbackEnabled
+            )
+        }
+        XCTAssertEqual(applied.selectedUID, "BlackHole2ch_UID")
+        XCTAssertFalse(applied.ducking)
+        XCTAssertFalse(applied.mediaPause)
+        XCTAssertFalse(applied.sound)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: UserDefaultsKeys.selectedInputDeviceUID), "BlackHole2ch_UID")
+        XCTAssertEqual(UserDefaults.standard.object(forKey: UserDefaultsKeys.audioDuckingEnabled) as? Bool, false)
+        XCTAssertEqual(UserDefaults.standard.object(forKey: UserDefaultsKeys.soundFeedbackEnabled) as? Bool, false)
+        XCTAssertEqual(UserDefaults.standard.object(forKey: UserDefaultsKeys.mediaPauseEnabled) as? Bool, false)
+
+        // 3. Restore the remembered writable fields.
+        var restoreBody = saved
+        restoreBody.removeValue(forKey: "input_devices")
+        restoreBody.removeValue(forKey: "active_input")
+        let restore = await router.route(HTTPRequest(
+            method: "PATCH",
+            path: "/v1/settings/audio",
+            queryParams: [:],
+            headers: ["content-type": "application/json"],
+            body: try JSONSerialization.data(withJSONObject: restoreBody)
+        ))
+        XCTAssertEqual(restore.status, 200)
+        XCTAssertEqual(try Self.jsonObject(restore) as NSDictionary, saved as NSDictionary)
+        let reread = await router.route(Self.audioSettingsGet)
+        XCTAssertEqual(try Self.jsonObject(reread) as NSDictionary, saved as NSDictionary)
+
+        // The stored list, including the disconnected QuadCast, matches the original byte for byte.
+        XCTAssertEqual(UserDefaults.standard.data(forKey: UserDefaultsKeys.inputDevicePriorityList), savedPriorityDefaults)
+        let restored = await MainActor.run {
+            (
+                priority: apiContext.audioDeviceService.inputDevicePriorityList,
+                selectedUID: apiContext.audioDeviceService.selectedDeviceUID,
+                level: apiContext.dictationViewModel.audioDuckingLevel,
+                mediaPause: apiContext.dictationViewModel.mediaPauseEnabled
+            )
+        }
+        XCTAssertEqual(restored.priority, [
+            AudioInputDevicePriorityItem(uid: "quadcast-uid", name: "HyperX QuadCast 2"),
+            AudioInputDevicePriorityItem(uid: "usb-microphone-uid", name: "USB Microphone"),
+        ])
+        XCTAssertEqual(restored.selectedUID, "usb-microphone-uid")
+        XCTAssertEqual(restored.level, 0.35)
+        XCTAssertTrue(restored.mediaPause)
     }
 
     func testDictionaryTermsEndpointsReplaceMergeAndDeleteSingleTerm() async throws {
@@ -2786,6 +3379,23 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
         XCTAssertEqual(rawResponse.status, 400)
         XCTAssertEqual((rawJSON["error"] as? [String: Any])?["message"] as? String, "Invalid 'x-apply-corrections' value")
+
+        for (header, value) in [("x-detect-speakers", "maybe"), ("x-speaker-count", "0")] {
+            let response = await router.route(
+                HTTPRequest(
+                    method: "POST",
+                    path: "/v1/transcribe",
+                    queryParams: [:],
+                    headers: ["content-type": "audio/wav", header: value],
+                    body: wavData
+                )
+            )
+            XCTAssertEqual(response.status, 400)
+            XCTAssertEqual(
+                (try Self.jsonObject(response)["error"] as? [String: Any])?["message"] as? String,
+                "Invalid '\(header)' value"
+            )
+        }
 
         let boundary = "Boundary-\(UUID().uuidString)"
         let multipartResponse = await router.route(
@@ -4119,6 +4729,12 @@ final class TypeWhisperIntegrationTests: XCTestCase {
                 ("Notes", "com.apple.Notes", nil)
             }
             apiContext.textInsertionService.selectedTextOverride = { nil }
+            // An unreadable field keeps the test independent of whatever is focused on the machine.
+            let unreadableElement = AXUIElementCreateSystemWide()
+            apiContext.textInsertionService.focusedTextElementOverride = { unreadableElement }
+            apiContext.textInsertionService.focusedTextStateOverride = { _ in
+                (value: nil, selectedText: nil, selectedRange: nil)
+            }
             apiContext.textInsertionService.pasteSimulatorOverride = {}
             let workflow = try XCTUnwrap(apiContext.workflowService.addWorkflow(
                 name: "Meeting notes",
@@ -4207,6 +4823,36 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         XCTAssertEqual(insertion?.id.uuidString, startID)
         XCTAssertEqual(insertion?.providerId, workflowPlugin.providerId)
         XCTAssertEqual(insertion?.modelId, "beta")
+
+        var latency: [String: Any]?
+        for _ in 0..<60 {
+            let response = try Self.jsonObject(
+                await router.route(HTTPRequest(
+                    method: "GET",
+                    path: "/v1/dictation/transcription",
+                    queryParams: ["id": startID],
+                    headers: [:],
+                    body: Data()
+                ))
+            )
+            latency = response["latency"] as? [String: Any]
+            if latency?["complete"] as? Bool == true { break }
+            try? await Task.sleep(for: .milliseconds(50))
+        }
+        let completedLatency = try XCTUnwrap(latency)
+        XCTAssertEqual(completedLatency["complete"] as? Bool, true)
+        XCTAssertEqual(completedLatency["failed"] as? Bool, false)
+        XCTAssertEqual(completedLatency["engine"] as? String, workflowPlugin.providerId)
+        XCTAssertEqual(completedLatency["model"] as? String, "beta")
+        XCTAssertEqual(completedLatency["insertion"] as? String, "paste")
+        XCTAssertEqual(completedLatency["llm_post_processing"] as? Bool, false)
+        XCTAssertEqual(completedLatency["recording_seconds"] as? Double, 1)
+        XCTAssertNotNil(completedLatency["paste_verification"] as? String)
+        let stopToTranscript = try XCTUnwrap(completedLatency["stop_to_final_transcript_ms"] as? Double)
+        let stopToInsertion = try XCTUnwrap(completedLatency["stop_to_insertion_ms"] as? Double)
+        XCTAssertGreaterThanOrEqual(stopToInsertion, stopToTranscript)
+        // Latency measurements never carry transcript content.
+        XCTAssertFalse(completedLatency.values.contains { $0 as? String == "transcribed" })
     }
 
     func testDictationEndpointsSpeakCompletedTranscriptionOnly() async throws {
@@ -5434,11 +6080,12 @@ final class TypeWhisperIntegrationTests: XCTestCase {
     }
 
     @MainActor
-    func testSyntheticPasteReturnsUnverifiedWhenFocusedTextStateIsUnavailable() async throws {
+    func testSyntheticPasteReturnsUnverifiedWhenNoTextElementIsFocused() async throws {
         let service = TextInsertionService()
         let pasteboard = NSPasteboard.withUniqueName()
         service.accessibilityGrantedOverride = true
         service.pasteboardProvider = { pasteboard }
+        service.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
         service.focusedTextElementOverride = { nil }
 
         var pasteCount = 0
@@ -5448,9 +6095,183 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
         let result = try await service.insertText("Hello", awaitPasteVerification: true)
 
-        XCTAssertEqual(result, .pasted(verification: .unverified(.focusedTextStateUnavailable)))
+        XCTAssertEqual(result, .pasted(verification: .unverified(.noFocusedTextElement)))
+        XCTAssertTrue(result.missedTextField)
         XCTAssertEqual(pasteCount, 1)
         XCTAssertEqual(pasteboard.string(forType: .string), "Hello")
+    }
+
+    @MainActor
+    func testSyntheticPasteReturnsUnverifiedWhenFocusedTextIsUnreadable() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.pasteVerificationAttempts = 1
+        service.pasteVerificationPollingDelay = .milliseconds(1)
+        service.focusedTextElementOverride = { element }
+        service.focusedTextStateOverride = { _ in (value: nil, selectedText: nil, selectedRange: nil) }
+        service.pasteSimulatorOverride = {}
+
+        let result = try await service.insertText("Hello", awaitPasteVerification: true)
+
+        XCTAssertEqual(result, .pasted(verification: .unverified(.focusedTextStateUnavailable)))
+        XCTAssertFalse(result.missedTextField)
+    }
+
+    @MainActor
+    func testFocusedElementWithoutCapturedStateIsNotReportedAsMissingTextField() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.focusedTextElementOverride = { element }
+        service.focusedTextStateOverride = { _ in nil }
+        service.pasteSimulatorOverride = {}
+
+        let result = try await service.insertText("Hello", awaitPasteVerification: true)
+
+        XCTAssertEqual(result, .pasted(verification: .unverified(.focusedTextStateUnavailable)))
+        XCTAssertFalse(result.missedTextField)
+    }
+
+    @MainActor
+    func testDetectMissedTextFieldReportsPasteWithoutFocusedTextElement() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        service.focusedTextElementOverride = { nil }
+        service.pasteSimulatorOverride = {}
+
+        let result = try await service.insertText("Hello", detectMissedTextField: true)
+
+        XCTAssertEqual(result, .pasted(verification: .unverified(.noFocusedTextElement)))
+        XCTAssertTrue(result.missedTextField)
+    }
+
+    @MainActor
+    func testDetectMissedTextFieldIgnoresTerminalWithoutTextElement() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.captureActiveAppOverride = { ("Ghostty", "com.mitchellh.ghostty", nil) }
+        service.focusedTextElementOverride = { nil }
+        service.pasteSimulatorOverride = {}
+
+        let result = try await service.insertText("Hello", detectMissedTextField: true)
+
+        XCTAssertEqual(result, .pasted(verification: .notAwaited))
+        XCTAssertFalse(result.missedTextField)
+    }
+
+    @MainActor
+    func testDetectMissedTextFieldIgnoresChromiumBrowserWithoutTextElement() async throws {
+        // Chromium reports no focused element until its accessibility tree is built.
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.captureActiveAppOverride = { ("Brave Browser", "com.brave.Browser", nil) }
+        service.focusedTextElementOverride = { nil }
+        service.pasteSimulatorOverride = {}
+
+        let result = try await service.insertText("Hello", detectMissedTextField: true)
+
+        XCTAssertEqual(result, .pasted(verification: .notAwaited))
+        XCTAssertFalse(result.missedTextField)
+    }
+
+    @MainActor
+    func testAutoEnterDoesNotReportMissedTextFieldInElectronAppWithoutTextElement() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.autoEnterDelay = .milliseconds(1)
+        service.captureActiveAppOverride = { ("Claude", "com.anthropic.claudefordesktop", nil) }
+        service.liveFieldElectronApplicationOverride = { $0 == "com.anthropic.claudefordesktop" }
+        service.focusedTextElementOverride = { nil }
+        service.pasteSimulatorOverride = {}
+        var returnCount = 0
+        service.returnSimulatorOverride = { returnCount += 1 }
+
+        let result = try await service.insertText("Hello", autoEnter: true, detectMissedTextField: true)
+
+        XCTAssertEqual(result, .pasted(verification: .unverified(.focusedTextStateUnavailable)))
+        XCTAssertFalse(result.missedTextField)
+        XCTAssertEqual(returnCount, 1)
+    }
+
+    @MainActor
+    func testDetectMissedTextFieldReportsReadableFieldThatStayedUnchanged() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.pasteVerificationAttempts = 1
+        service.pasteVerificationPollingDelay = .milliseconds(1)
+        service.focusedTextElementOverride = { element }
+        service.focusedTextStateOverride = { _ in
+            (value: "Before", selectedText: nil, selectedRange: NSRange(location: 6, length: 0))
+        }
+        service.pasteSimulatorOverride = {}
+
+        let result = try await service.insertText("Hello", detectMissedTextField: true)
+
+        XCTAssertEqual(result, .pasted(verification: .unverified(.focusedTextUnchanged)))
+        XCTAssertTrue(result.missedTextField)
+    }
+
+    @MainActor
+    func testDetectMissedTextFieldVerifiesPasteIntoReadableField() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        var pasteCount = 0
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.pasteVerificationPollingDelay = .milliseconds(1)
+        service.focusedTextElementOverride = { element }
+        service.focusedTextStateOverride = { _ in
+            pasteCount == 0
+                ? (value: "", selectedText: nil, selectedRange: NSRange(location: 0, length: 0))
+                : (value: "Hello", selectedText: nil, selectedRange: NSRange(location: 5, length: 0))
+        }
+        service.pasteSimulatorOverride = { pasteCount += 1 }
+
+        let result = try await service.insertText("Hello", detectMissedTextField: true)
+
+        XCTAssertEqual(result, .pasted(verification: .verified))
+        XCTAssertFalse(result.missedTextField)
+    }
+
+    @MainActor
+    func testDetectMissedTextFieldDoesNotWaitForUnreadableField() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        var stateReadCount = 0
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.focusedTextElementOverride = { element }
+        service.focusedTextStateOverride = { _ in
+            stateReadCount += 1
+            return (value: nil, selectedText: nil, selectedRange: nil)
+        }
+        service.pasteSimulatorOverride = {}
+
+        let result = try await service.insertText("Hello", detectMissedTextField: true)
+
+        XCTAssertEqual(result, .pasted(verification: .notAwaited))
+        XCTAssertFalse(result.missedTextField)
+        // Only the state captured before the paste; verification never polled the field.
+        XCTAssertEqual(stateReadCount, 1)
     }
 
     @MainActor
@@ -5459,6 +6280,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         let pasteboard = NSPasteboard.withUniqueName()
         service.accessibilityGrantedOverride = true
         service.pasteboardProvider = { pasteboard }
+        service.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
         service.focusedTextElementOverride = { nil }
         service.defaultPasteFallbackRestoreDelay = .milliseconds(80)
 
@@ -5485,7 +6307,83 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         XCTAssertEqual(pasteboard.string(forType: .string), "Hello")
 
         let restoreVerification = await service.waitForPendingClipboardRestore()
-        XCTAssertEqual(restoreVerification, .unverified(.focusedTextStateUnavailable))
+        XCTAssertEqual(restoreVerification, .unverified(.noFocusedTextElement))
+        XCTAssertEqual(pasteboard.string(forType: .string), "Existing")
+    }
+
+    @MainActor
+    func testAwaitedPasteTimingExcludesVerificationWaitAndAutoEnterDelay() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.focusedTextElementOverride = { element }
+        service.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        service.verifiedRestoreGraceDelay = .milliseconds(1)
+        service.autoEnterDelay = .milliseconds(150)
+        service.returnSimulatorOverride = {}
+
+        var pasteCount = 0
+        service.pasteSimulatorOverride = { pasteCount += 1 }
+        service.focusedTextStateOverride = { _ in
+            pasteCount == 0
+                ? (value: "", selectedText: nil, selectedRange: NSRange(location: 0, length: 0))
+                : (value: "Hello", selectedText: nil, selectedRange: NSRange(location: 5, length: 0))
+        }
+
+        let result = try await service.insertText("Hello", preserveClipboard: true, autoEnter: true)
+        let returnedUptime = DispatchTime.now().uptimeNanoseconds
+
+        XCTAssertEqual(result, .pasted(verification: .verified))
+        let timing = try XCTUnwrap(service.lastInsertionTiming)
+        let verifiedUptime = try XCTUnwrap(timing.verifiedUptimeNanoseconds)
+        XCTAssertLessThanOrEqual(timing.insertedUptimeNanoseconds, verifiedUptime)
+        // The Auto Enter delay runs after verification and counts toward neither time.
+        XCTAssertGreaterThanOrEqual(returnedUptime - verifiedUptime, 150_000_000)
+    }
+
+    @MainActor
+    func testClipboardRestoreReportsSkippedRestoreWhenClipboardChanged() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.focusedTextElementOverride = { nil }
+        service.defaultPasteFallbackRestoreDelay = .milliseconds(30)
+        service.pasteSimulatorOverride = {}
+
+        pasteboard.clearContents()
+        pasteboard.setString("Existing", forType: .string)
+
+        _ = try await service.insertText("Hello", preserveClipboard: true)
+        let pending = try XCTUnwrap(service.pendingClipboardRestoreTasks())
+        pasteboard.clearContents()
+        pasteboard.setString("Copied meanwhile", forType: .string)
+
+        let outcome = await pending.restore.value
+        XCTAssertFalse(outcome.restored)
+        XCTAssertEqual(pasteboard.string(forType: .string), "Copied meanwhile")
+    }
+
+    @MainActor
+    func testClipboardRestoreReportsRestoredSnapshot() async throws {
+        let service = TextInsertionService()
+        let pasteboard = NSPasteboard.withUniqueName()
+        service.accessibilityGrantedOverride = true
+        service.pasteboardProvider = { pasteboard }
+        service.focusedTextElementOverride = { nil }
+        service.defaultPasteFallbackRestoreDelay = .milliseconds(30)
+        service.pasteSimulatorOverride = {}
+
+        pasteboard.clearContents()
+        pasteboard.setString("Existing", forType: .string)
+
+        _ = try await service.insertText("Hello", preserveClipboard: true)
+        let pending = try XCTUnwrap(service.pendingClipboardRestoreTasks())
+
+        let outcome = await pending.restore.value
+        XCTAssertTrue(outcome.restored)
         XCTAssertEqual(pasteboard.string(forType: .string), "Existing")
     }
 
@@ -5564,43 +6462,55 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
     @MainActor
     func testTerminalBundleForcesSyntheticPasteInsteadOfDirectAccessibilityInsertion() async throws {
-        let service = TextInsertionService()
-        let pasteboard = NSPasteboard.withUniqueName()
-        let element = AXUIElementCreateSystemWide()
-        service.accessibilityGrantedOverride = true
-        service.pasteboardProvider = { pasteboard }
-        service.focusedTextElementOverride = { element }
-        service.captureActiveAppOverride = { ("iTerm2", "com.googlecode.iterm2", nil) }
-        service.terminalPasteFallbackRestoreDelay = .milliseconds(1)
+        // cmux accepts AX writes but updates AXValue only after the terminal redraws, so a
+        // direct insertion looks unverified and the fallback paste would insert it again.
+        let applications = [
+            (name: "iTerm2", bundleIdentifier: "com.googlecode.iterm2"),
+            (name: "cmux", bundleIdentifier: "com.cmuxterm.app")
+        ]
 
-        var pasteCount = 0
-        service.pasteSimulatorOverride = {
-            pasteCount += 1
-        }
-        service.focusedTextStateOverride = { _ in
-            if pasteCount == 0 {
-                return (value: "", selectedText: nil, selectedRange: NSRange(location: 0, length: 0))
+        for application in applications {
+            let service = TextInsertionService()
+            let pasteboard = NSPasteboard.withUniqueName()
+            let element = AXUIElementCreateSystemWide()
+            service.accessibilityGrantedOverride = true
+            service.pasteboardProvider = { pasteboard }
+            service.focusedTextElementOverride = { element }
+            service.captureActiveAppOverride = { (application.name, application.bundleIdentifier, nil) }
+            service.terminalPasteFallbackRestoreDelay = .milliseconds(1)
+
+            var pasteCount = 0
+            service.pasteSimulatorOverride = {
+                pasteCount += 1
             }
-            return (value: "Hello", selectedText: nil, selectedRange: NSRange(location: 5, length: 0))
+            service.focusedTextStateOverride = { _ in
+                if pasteCount == 0 {
+                    return (value: "", selectedText: nil, selectedRange: NSRange(location: 0, length: 0))
+                }
+                return (value: "Hello", selectedText: nil, selectedRange: NSRange(location: 5, length: 0))
+            }
+
+            var didAttemptDirectAXInsertion = false
+            service.insertTextAtOverride = { _, _ in
+                didAttemptDirectAXInsertion = true
+                return true
+            }
+
+            pasteboard.clearContents()
+            pasteboard.setString("Existing", forType: .string)
+
+            let result = try await service.insertText("Hello", preserveClipboard: true)
+            let restoreVerification = await service.waitForPendingClipboardRestore()
+
+            XCTAssertFalse(
+                didAttemptDirectAXInsertion,
+                "\(application.name) should bypass direct AX insertion"
+            )
+            XCTAssertEqual(pasteCount, 1, "\(application.name) should paste exactly once")
+            XCTAssertEqual(result, .pasted(verification: .notAwaited))
+            XCTAssertEqual(restoreVerification, .verified)
+            XCTAssertEqual(pasteboard.string(forType: .string), "Existing")
         }
-
-        var didAttemptDirectAXInsertion = false
-        service.insertTextAtOverride = { _, _ in
-            didAttemptDirectAXInsertion = true
-            return true
-        }
-
-        pasteboard.clearContents()
-        pasteboard.setString("Existing", forType: .string)
-
-        let result = try await service.insertText("Hello", preserveClipboard: true)
-        let restoreVerification = await service.waitForPendingClipboardRestore()
-
-        XCTAssertFalse(didAttemptDirectAXInsertion)
-        XCTAssertEqual(pasteCount, 1)
-        XCTAssertEqual(result, .pasted(verification: .notAwaited))
-        XCTAssertEqual(restoreVerification, .verified)
-        XCTAssertEqual(pasteboard.string(forType: .string), "Existing")
     }
 
     @MainActor
@@ -6282,7 +7192,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
         let restoreVerification = await harness.service.waitForPendingClipboardRestore()
 
-        XCTAssertEqual(restoreVerification, .unverified(.focusedTextStateUnavailable))
+        XCTAssertEqual(restoreVerification, .unverified(.noFocusedTextElement))
         XCTAssertNil(harness.pasteboard.string(forType: .string))
         XCTAssertTrue(harness.pasteboard.pasteboardItems?.isEmpty ?? true)
     }
@@ -6337,7 +7247,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
                 XCTAssertEqual(
                     restoreVerification,
-                    target.verifiesPaste ? .verified : .unverified(.focusedTextStateUnavailable),
+                    target.verifiesPaste ? .verified : .unverified(.noFocusedTextElement),
                     label
                 )
                 XCTAssertEqual(harness.pasteboard.changeCount, changeCountAfterUserWrite, label)
@@ -7343,6 +8253,80 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         XCTAssertEqual(session.transcription?.rawText, "batch")
     }
 
+    @MainActor
+    func testDroppedLiveConnectionTranscribesFullRecordingInsteadOfVisiblePreview() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        var dictationContext: DictationContext?
+        defer {
+            EventBus.shared?.emissionObserverForTesting = nil
+            dictationContext = nil
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        dictationContext = Self.makeDictationContext(appSupportDirectory: appSupportDirectory)
+        let context = try XCTUnwrap(dictationContext)
+        var finalPartialTexts: [String] = []
+        EventBus.shared.emissionObserverForTesting = { event in
+            if case .partialTranscriptionUpdate(let payload) = event, payload.isFinal {
+                finalPartialTexts.append(payload.text)
+            }
+        }
+        let livePlugin = MockLiveDictationPlugin()
+        livePlugin.failsAudioAppend = true
+        PluginManager.shared.loadedPlugins.append(LoadedPlugin(
+            manifest: PluginManifest(
+                id: "com.typewhisper.mock.live-dictation",
+                name: "Mock Live Dictation",
+                version: "1.0.0",
+                principalClass: "APIRouterMockLiveDictationPlugin",
+                capabilities: [PluginCapability.liveDictation.rawValue]
+            ),
+            instance: livePlugin,
+            bundle: Bundle.main,
+            sourceURL: appSupportDirectory,
+            isEnabled: true
+        ))
+        context.modelManager.selectProvider(livePlugin.providerId)
+        let originalPreviewEnabled = context.dictationViewModel.indicatorTranscriptPreviewEnabled
+        defer { context.dictationViewModel.indicatorTranscriptPreviewEnabled = originalPreviewEnabled }
+        context.dictationViewModel.indicatorTranscriptPreviewEnabled = true
+        let pasteboard = NSPasteboard.withUniqueName()
+        context.textInsertionService.pasteboardProvider = { pasteboard }
+        context.textInsertionService.captureActiveAppOverride = {
+            ("Notes", "com.apple.Notes", nil)
+        }
+        context.textInsertionService.accessibilityGrantedOverride = true
+        context.textInsertionService.selectedTextOverride = { nil }
+        context.textInsertionService.pasteSimulatorOverride = {}
+        context.audioRecordingService.hasMicrophonePermissionOverride = true
+        context.audioRecordingService.inputAvailabilityOverride = { _ in true }
+        context.audioRecordingService.startRecordingOverride = {}
+        let recording = Array(repeating: Float(0.25), count: Int(AudioRecordingService.targetSampleRate))
+        context.audioRecordingService.stopRecordingOverride = { _ in recording }
+
+        let sessionID = context.dictationViewModel.apiStartRecording()
+        await context.dictationViewModel.testingWaitForRecordingStart()
+        for _ in 0..<20 where livePlugin.liveSessionCreateCount == 0 {
+            try await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(livePlugin.liveSessionCreateCount, 1)
+        // The preview froze at the words recognized before the connection dropped.
+        context.dictationViewModel.partialText = "words before the drop"
+
+        _ = context.dictationViewModel.apiStopRecording()
+        await Self.waitForDictationSessionToFinish(context.dictationViewModel, id: sessionID)
+
+        let session = try XCTUnwrap(context.dictationViewModel.apiDictationSession(id: sessionID))
+        XCTAssertEqual(session.status, .completed)
+        XCTAssertEqual(session.transcription?.rawText, "batch")
+        XCTAssertEqual(livePlugin.liveSessionCancelCount, 1)
+        // Every recorded sample reached batch transcription; the rest is silent padding.
+        let batchSamples = livePlugin.lastBatchTranscriptionSamples
+        XCTAssertEqual(Array(batchSamples.prefix(recording.count)), recording)
+        XCTAssertTrue(batchSamples.dropFirst(recording.count).allSatisfy { $0 == 0 })
+        XCTAssertEqual(finalPartialTexts, [])
+    }
+
     /// Returns the live-dictation session count before and after the browser URL
     /// resolves, with the preview hidden and a website workflow for example.com.
     @MainActor
@@ -7901,7 +8885,12 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         }
         context.textInsertionService.accessibilityGrantedOverride = true
         context.textInsertionService.selectedTextOverride = { nil }
-        context.textInsertionService.focusedTextElementOverride = { nil }
+        // An unreadable field: the paste cannot be verified, so no Insert offer keeps the indicator busy.
+        let unreadableElement = AXUIElementCreateSystemWide()
+        context.textInsertionService.focusedTextElementOverride = { unreadableElement }
+        context.textInsertionService.focusedTextStateOverride = { _ in
+            (value: nil, selectedText: nil, selectedRange: nil)
+        }
         context.textInsertionService.pasteVerificationAttempts = 0
         context.textInsertionService.pasteSimulatorOverride = {}
         context.textInsertionService.returnSimulatorOverride = {
@@ -8274,7 +9263,12 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         context.textInsertionService.captureActiveAppOverride = { ("Chrome", "com.google.Chrome", nil) }
         context.textInsertionService.accessibilityGrantedOverride = true
         context.textInsertionService.selectedTextOverride = { nil }
-        context.textInsertionService.focusedTextElementOverride = { nil }
+        // An unreadable field: the paste cannot be verified, so no Insert offer keeps the indicator busy.
+        let unreadableElement = AXUIElementCreateSystemWide()
+        context.textInsertionService.focusedTextElementOverride = { unreadableElement }
+        context.textInsertionService.focusedTextStateOverride = { _ in
+            (value: nil, selectedText: nil, selectedRange: nil)
+        }
         context.textInsertionService.pasteSimulatorOverride = { pasted.fulfill() }
         context.audioRecordingService.hasMicrophonePermissionOverride = true
         context.audioRecordingService.inputAvailabilityOverride = { _ in true }
@@ -8734,7 +9728,12 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         }
         context.textInsertionService.accessibilityGrantedOverride = true
         context.textInsertionService.selectedTextOverride = { nil }
-        context.textInsertionService.focusedTextElementOverride = { nil }
+        // An unreadable field: the paste cannot be verified, so no Insert offer keeps the indicator busy.
+        let unreadableElement = AXUIElementCreateSystemWide()
+        context.textInsertionService.focusedTextElementOverride = { unreadableElement }
+        context.textInsertionService.focusedTextStateOverride = { _ in
+            (value: nil, selectedText: nil, selectedRange: nil)
+        }
         context.textInsertionService.pasteVerificationAttempts = 0
         context.textInsertionService.pasteSimulatorOverride = {}
         context.textInsertionService.returnSimulatorOverride = {
@@ -9066,6 +10065,259 @@ final class TypeWhisperIntegrationTests: XCTestCase {
     }
 
     @MainActor
+    func testDictationWithoutFocusedTextFieldOffersToInsertTranscript() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        let preserveClipboardKey = UserDefaultsKeys.preserveClipboard
+        let liveFieldKey = UserDefaultsKeys.liveFieldTranscriptEnabled
+        let originalPreserveClipboard = UserDefaults.standard.object(forKey: preserveClipboardKey)
+        let originalLiveFieldSetting = UserDefaults.standard.object(forKey: liveFieldKey)
+        var dictationContext: DictationContext?
+        defer {
+            dictationContext = nil
+            Self.restoreUserDefault(originalPreserveClipboard, forKey: preserveClipboardKey)
+            Self.restoreUserDefault(originalLiveFieldSetting, forKey: liveFieldKey)
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        UserDefaults.standard.set(false, forKey: preserveClipboardKey)
+        UserDefaults.standard.set(false, forKey: liveFieldKey)
+
+        dictationContext = Self.makeDictationContext(appSupportDirectory: appSupportDirectory)
+        let context = try XCTUnwrap(dictationContext)
+        context.dictationViewModel.preserveClipboard = false
+        context.dictationViewModel.soundFeedbackEnabled = false
+        context.dictationViewModel.spokenFeedbackEnabled = false
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        var isTextFieldFocused = false
+        var pastedTexts: [String] = []
+        context.textInsertionService.pasteboardProvider = { pasteboard }
+        context.textInsertionService.captureActiveAppOverride = { ("Finder", "com.apple.finder", nil) }
+        context.textInsertionService.accessibilityGrantedOverride = true
+        context.textInsertionService.selectedTextOverride = { nil }
+        context.textInsertionService.pasteVerificationPollingDelay = .milliseconds(1)
+        context.textInsertionService.pendingPasteSettleWindow = .milliseconds(1)
+        context.textInsertionService.focusedTextElementOverride = { isTextFieldFocused ? element : nil }
+        context.textInsertionService.focusedTextStateOverride = { _ in
+            let value = pastedTexts.count >= 3 ? "transcribed" : ""
+            return (value: value, selectedText: nil, selectedRange: NSRange(location: value.count, length: 0))
+        }
+        context.textInsertionService.pasteSimulatorOverride = {
+            pastedTexts.append(pasteboard.string(forType: .string) ?? "")
+        }
+        context.audioRecordingService.hasMicrophonePermissionOverride = true
+        context.audioRecordingService.inputAvailabilityOverride = { _ in true }
+        context.audioRecordingService.startRecordingOverride = {}
+        context.audioRecordingService.stopRecordingOverride = { _ in
+            Array(repeating: 0.25, count: Int(AudioRecordingService.targetSampleRate))
+        }
+        let noTextFieldMessage = try TestSupport.localizedCatalogValueForCurrentLocale(for: "No text field detected")
+        let insertTitle = try TestSupport.localizedCatalogValueForCurrentLocale(for: "Insert")
+        let insertedMessage = try TestSupport.localizedCatalogValueForCurrentLocale(for: "Text inserted")
+        let viewModel = context.dictationViewModel
+
+        let sessionID = viewModel.apiStartRecording()
+        await viewModel.testingWaitForRecordingStart()
+        _ = viewModel.apiStopRecording()
+
+        for _ in 0..<80 {
+            if viewModel.apiDictationSession(id: sessionID)?.status == .completed,
+               viewModel.actionFeedbackMessage != nil {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(pastedTexts, ["transcribed"])
+        XCTAssertEqual(viewModel.state, .inserting)
+        XCTAssertTrue(viewModel.actionFeedbackMessage?.hasPrefix(noTextFieldMessage) == true)
+        XCTAssertEqual(viewModel.actionFeedbackActionTitle, insertTitle)
+        XCTAssertNil(viewModel.lastSuccessfulDictationInsertion)
+
+        // Clicking Insert without focusing a field misses again and keeps the offer.
+        viewModel.performActionFeedbackAction()
+        // A new API dictation waits until the running Insert has pasted.
+        XCTAssertFalse(viewModel.canStartAPIRecording)
+        for _ in 0..<80 {
+            if pastedTexts.count == 2 {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        try? await Task.sleep(for: .milliseconds(50))
+
+        XCTAssertEqual(pastedTexts, ["transcribed", "transcribed"])
+        XCTAssertTrue(viewModel.actionFeedbackMessage?.hasPrefix(noTextFieldMessage) == true)
+        XCTAssertEqual(viewModel.actionFeedbackActionTitle, insertTitle)
+        // A new API dictation may replace the offer, as the dictation hotkey does.
+        XCTAssertTrue(viewModel.canStartAPIRecording)
+
+        // A failing Insert shows the error and keeps the offer.
+        context.textInsertionService.accessibilityGrantedOverride = false
+        viewModel.performActionFeedbackAction()
+        let accessibilityError = TextInsertionService.TextInsertionError.accessibilityNotGranted.localizedDescription
+        for _ in 0..<80 {
+            if viewModel.actionFeedbackMessage == accessibilityError {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(viewModel.actionFeedbackMessage, accessibilityError)
+        XCTAssertEqual(viewModel.actionFeedbackActionTitle, insertTitle)
+        context.textInsertionService.accessibilityGrantedOverride = true
+
+        isTextFieldFocused = true
+        viewModel.performActionFeedbackAction()
+        for _ in 0..<80 {
+            if viewModel.actionFeedbackMessage == insertedMessage {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(pastedTexts, ["transcribed", "transcribed", "transcribed"])
+        XCTAssertEqual(viewModel.actionFeedbackMessage, insertedMessage)
+        XCTAssertNil(viewModel.actionFeedbackActionTitle)
+        // The verified Insert counts as the dictation's successful insertion.
+        XCTAssertEqual(viewModel.lastSuccessfulDictationInsertion?.id, sessionID)
+    }
+
+    @MainActor
+    func testDictationHotkeyDuringInsertStartsAfterThePaste() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        let preserveClipboardKey = UserDefaultsKeys.preserveClipboard
+        let liveFieldKey = UserDefaultsKeys.liveFieldTranscriptEnabled
+        let originalPreserveClipboard = UserDefaults.standard.object(forKey: preserveClipboardKey)
+        let originalLiveFieldSetting = UserDefaults.standard.object(forKey: liveFieldKey)
+        var dictationContext: DictationContext?
+        defer {
+            dictationContext = nil
+            Self.restoreUserDefault(originalPreserveClipboard, forKey: preserveClipboardKey)
+            Self.restoreUserDefault(originalLiveFieldSetting, forKey: liveFieldKey)
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        UserDefaults.standard.set(false, forKey: preserveClipboardKey)
+        UserDefaults.standard.set(false, forKey: liveFieldKey)
+
+        dictationContext = Self.makeDictationContext(appSupportDirectory: appSupportDirectory)
+        let context = try XCTUnwrap(dictationContext)
+        let viewModel = context.dictationViewModel
+        viewModel.preserveClipboard = false
+        viewModel.soundFeedbackEnabled = false
+        viewModel.spokenFeedbackEnabled = false
+        let pasteboard = NSPasteboard.withUniqueName()
+        var statesAtPaste: [DictationViewModel.State] = []
+        context.textInsertionService.pasteboardProvider = { pasteboard }
+        context.textInsertionService.captureActiveAppOverride = { ("Finder", "com.apple.finder", nil) }
+        context.textInsertionService.accessibilityGrantedOverride = true
+        context.textInsertionService.selectedTextOverride = { nil }
+        context.textInsertionService.pendingPasteSettleWindow = .milliseconds(1)
+        context.textInsertionService.focusedTextElementOverride = { nil }
+        context.textInsertionService.pasteSimulatorOverride = { statesAtPaste.append(viewModel.state) }
+        context.audioRecordingService.hasMicrophonePermissionOverride = true
+        context.audioRecordingService.inputAvailabilityOverride = { _ in true }
+        context.audioRecordingService.startRecordingOverride = {}
+        context.audioRecordingService.stopRecordingOverride = { _ in
+            Array(repeating: 0.25, count: Int(AudioRecordingService.targetSampleRate))
+        }
+        let insertTitle = try TestSupport.localizedCatalogValueForCurrentLocale(for: "Insert")
+
+        let sessionID = viewModel.apiStartRecording()
+        await viewModel.testingWaitForRecordingStart()
+        _ = viewModel.apiStopRecording()
+        for _ in 0..<80 {
+            if viewModel.apiDictationSession(id: sessionID)?.status == .completed,
+               viewModel.actionFeedbackActionTitle == insertTitle {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+        XCTAssertEqual(viewModel.actionFeedbackActionTitle, insertTitle)
+
+        viewModel.performActionFeedbackAction()
+        context.hotkeyService.onDictationStart?(DispatchTime.now().uptimeNanoseconds)
+
+        // The new dictation waits for the running Insert instead of replacing the offer.
+        XCTAssertEqual(viewModel.state, .inserting)
+        for _ in 0..<80 {
+            if viewModel.state == .recording {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(viewModel.state, .recording)
+        // The Insert paste landed before recording started.
+        XCTAssertEqual(statesAtPaste.count, 2)
+        XCTAssertEqual(statesAtPaste.last, .inserting)
+        viewModel.handleCancelHotkey()
+    }
+
+    @MainActor
+    func testDictationIntoReadableTextFieldDoesNotOfferToInsertTranscript() async throws {
+        let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
+        let preserveClipboardKey = UserDefaultsKeys.preserveClipboard
+        let liveFieldKey = UserDefaultsKeys.liveFieldTranscriptEnabled
+        let originalPreserveClipboard = UserDefaults.standard.object(forKey: preserveClipboardKey)
+        let originalLiveFieldSetting = UserDefaults.standard.object(forKey: liveFieldKey)
+        var dictationContext: DictationContext?
+        defer {
+            dictationContext = nil
+            Self.restoreUserDefault(originalPreserveClipboard, forKey: preserveClipboardKey)
+            Self.restoreUserDefault(originalLiveFieldSetting, forKey: liveFieldKey)
+            TestSupport.remove(appSupportDirectory)
+        }
+
+        UserDefaults.standard.set(false, forKey: preserveClipboardKey)
+        UserDefaults.standard.set(false, forKey: liveFieldKey)
+
+        dictationContext = Self.makeDictationContext(appSupportDirectory: appSupportDirectory)
+        let context = try XCTUnwrap(dictationContext)
+        context.dictationViewModel.preserveClipboard = false
+        context.dictationViewModel.soundFeedbackEnabled = false
+        context.dictationViewModel.spokenFeedbackEnabled = false
+        let pasteboard = NSPasteboard.withUniqueName()
+        let element = AXUIElementCreateSystemWide()
+        var pasteCount = 0
+        context.textInsertionService.pasteboardProvider = { pasteboard }
+        context.textInsertionService.captureActiveAppOverride = { ("Notes", "com.apple.Notes", nil) }
+        context.textInsertionService.accessibilityGrantedOverride = true
+        context.textInsertionService.selectedTextOverride = { nil }
+        context.textInsertionService.pasteVerificationPollingDelay = .milliseconds(1)
+        context.textInsertionService.focusedTextElementOverride = { element }
+        context.textInsertionService.focusedTextStateOverride = { _ in
+            let value = pasteCount > 0 ? "transcribed" : ""
+            return (value: value, selectedText: nil, selectedRange: NSRange(location: value.count, length: 0))
+        }
+        context.textInsertionService.pasteSimulatorOverride = { pasteCount += 1 }
+        context.audioRecordingService.hasMicrophonePermissionOverride = true
+        context.audioRecordingService.inputAvailabilityOverride = { _ in true }
+        context.audioRecordingService.startRecordingOverride = {}
+        context.audioRecordingService.stopRecordingOverride = { _ in
+            Array(repeating: 0.25, count: Int(AudioRecordingService.targetSampleRate))
+        }
+
+        let sessionID = context.dictationViewModel.apiStartRecording()
+        await context.dictationViewModel.testingWaitForRecordingStart()
+        _ = context.dictationViewModel.apiStopRecording()
+
+        for _ in 0..<80 {
+            if context.dictationViewModel.apiDictationSession(id: sessionID)?.status == .completed,
+               context.dictationViewModel.state == .inserting {
+                break
+            }
+            try? await Task.sleep(for: .milliseconds(25))
+        }
+
+        XCTAssertEqual(pasteCount, 1)
+        XCTAssertEqual(context.dictationViewModel.state, .inserting)
+        XCTAssertNil(context.dictationViewModel.actionFeedbackMessage)
+        XCTAssertNil(context.dictationViewModel.actionFeedbackActionTitle)
+    }
+
+    @MainActor
     func testDictationWithoutReadableFocusedTextRecordsUnsupportedCorrectionLearningAttempt() async throws {
         let appSupportDirectory = try TestSupport.makeTemporaryDirectory()
         let licenseSuiteName = "TypeWhisperIntegrationTests.License.\(UUID().uuidString)"
@@ -9114,7 +10366,12 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         }
         context.textInsertionService.accessibilityGrantedOverride = true
         context.textInsertionService.selectedTextOverride = { nil }
-        context.textInsertionService.focusedTextElementOverride = { nil }
+        // An unreadable field: TypeWhisper cannot observe the text, but the paste may have landed.
+        let unreadableElement = AXUIElementCreateSystemWide()
+        context.textInsertionService.focusedTextElementOverride = { unreadableElement }
+        context.textInsertionService.focusedTextStateOverride = { _ in
+            (value: nil, selectedText: nil, selectedRange: nil)
+        }
         context.textInsertionService.pasteSimulatorOverride = {}
         var accessibilityObservationBundleIdentifiers: [String?] = []
         var accessibilityObservationEndCount = 0
@@ -9194,7 +10451,12 @@ final class TypeWhisperIntegrationTests: XCTestCase {
         }
         context.textInsertionService.accessibilityGrantedOverride = true
         context.textInsertionService.selectedTextOverride = { nil }
-        context.textInsertionService.focusedTextElementOverride = { nil }
+        // An unreadable field: TypeWhisper cannot observe the text, but the paste may have landed.
+        let unreadableElement = AXUIElementCreateSystemWide()
+        context.textInsertionService.focusedTextElementOverride = { unreadableElement }
+        context.textInsertionService.focusedTextStateOverride = { _ in
+            (value: nil, selectedText: nil, selectedRange: nil)
+        }
         context.textInsertionService.pasteSimulatorOverride = {}
         var accessibilityObservationBundleIdentifiers: [String?] = []
         var accessibilityObservationEndCount = 0
@@ -9537,6 +10799,109 @@ final class TypeWhisperIntegrationTests: XCTestCase {
 
         XCTAssertEqual(events, ["start_audio", "start_sound"])
         XCTAssertTrue(context.dictationViewModel.isRecordingInputReady)
+    }
+
+    @MainActor
+    func testRecordingStartupVolumeChangeIsRestoredOnCancelOrFailure() async throws {
+        let originalDuckingEnabled = UserDefaults.standard.object(forKey: UserDefaultsKeys.audioDuckingEnabled)
+        let originalDuckingLevel = UserDefaults.standard.object(forKey: UserDefaultsKeys.audioDuckingLevel)
+        let originalCancellation = UserDefaults.standard.object(forKey: UserDefaultsKeys.cancellationBehavior)
+        let originalSoundFeedback = UserDefaults.standard.object(forKey: UserDefaultsKeys.soundFeedbackEnabled)
+        defer {
+            Self.restoreUserDefault(originalDuckingEnabled, forKey: UserDefaultsKeys.audioDuckingEnabled)
+            Self.restoreUserDefault(originalDuckingLevel, forKey: UserDefaultsKeys.audioDuckingLevel)
+            Self.restoreUserDefault(originalCancellation, forKey: UserDefaultsKeys.cancellationBehavior)
+            Self.restoreUserDefault(originalSoundFeedback, forKey: UserDefaultsKeys.soundFeedbackEnabled)
+        }
+
+        for (label, inputReady, startFails, duckingEnabled) in [
+            ("cancel after ducking", true, false, true),
+            ("cancel before first buffer", false, false, true),
+            ("startup failure", false, true, true),
+            ("ducking disabled", true, false, false),
+        ] {
+            let directory = try TestSupport.makeTemporaryDirectory()
+            defer { TestSupport.remove(directory) }
+            let volume = IntegrationOutputVolumeController()
+            let ducking = AudioDuckingService(volumeController: volume)
+            let context = Self.makeDictationContext(appSupportDirectory: directory, audioDuckingService: ducking)
+            context.dictationViewModel.audioDuckingEnabled = duckingEnabled
+            context.dictationViewModel.audioDuckingLevel = 0.2
+            context.dictationViewModel.soundFeedbackEnabled = false
+            context.dictationViewModel.cancellationBehavior = .doubleEscape
+            context.audioRecordingService.hasMicrophonePermissionOverride = true
+            context.audioRecordingService.inputAvailabilityOverride = { _ in true }
+            context.audioRecordingService.startRecordingOverride = {
+                // USB speakerphone capture startup can change the shared output volume.
+                volume.volume = 0
+                if startFails { throw NSError(domain: "test-recording-start", code: 1) }
+            }
+            context.audioRecordingService.stopRecordingOverride = { _ in [] }
+
+            _ = context.dictationViewModel.apiStartRecording()
+            await context.dictationViewModel.testingWaitForRecordingStart()
+            if !startFails {
+                if inputReady {
+                    context.audioRecordingService.testingNotifyFirstRecordingAudioBuffer()
+                    XCTAssertEqual(volume.volume, duckingEnabled ? 0.15 : 0, accuracy: 0.0001, label)
+                }
+                context.dictationViewModel.handleCancelHotkey()
+                context.dictationViewModel.handleCancelHotkey()
+                await context.dictationViewModel.testingWaitForRecordingCleanup()
+            }
+
+            XCTAssertEqual(volume.volume, duckingEnabled ? 0.75 : 0, accuracy: 0.0001, label)
+            if !duckingEnabled { XCTAssertTrue(volume.writes.isEmpty, label) }
+        }
+    }
+
+    @MainActor
+    func testRecordingStartupVolumeChangeIsRestoredOnExternalCancellation() async throws {
+        let originalDuckingEnabled = UserDefaults.standard.object(forKey: UserDefaultsKeys.audioDuckingEnabled)
+        let originalSoundFeedback = UserDefaults.standard.object(forKey: UserDefaultsKeys.soundFeedbackEnabled)
+        let originalCancellation = UserDefaults.standard.object(forKey: UserDefaultsKeys.cancellationBehavior)
+        let directory = try TestSupport.makeTemporaryDirectory()
+        let audioStartEntered = expectation(description: "Recording startup changed output volume")
+        let audioStartGate = DispatchSemaphore(value: 0)
+        defer {
+            audioStartGate.signal()
+            TestSupport.remove(directory)
+            Self.restoreUserDefault(originalDuckingEnabled, forKey: UserDefaultsKeys.audioDuckingEnabled)
+            Self.restoreUserDefault(originalSoundFeedback, forKey: UserDefaultsKeys.soundFeedbackEnabled)
+            Self.restoreUserDefault(originalCancellation, forKey: UserDefaultsKeys.cancellationBehavior)
+        }
+
+        let volume = IntegrationOutputVolumeController()
+        let ducking = AudioDuckingService(volumeController: volume)
+        let context = Self.makeDictationContext(appSupportDirectory: directory, audioDuckingService: ducking)
+        context.dictationViewModel.audioDuckingEnabled = true
+        context.dictationViewModel.soundFeedbackEnabled = false
+        context.dictationViewModel.cancellationBehavior = .doubleEscape
+        context.audioRecordingService.hasMicrophonePermissionOverride = true
+        context.audioRecordingService.inputAvailabilityOverride = { _ in true }
+        context.audioRecordingService.startRecordingOverride = {
+            volume.volume = 0
+            audioStartEntered.fulfill()
+            audioStartGate.wait()
+        }
+        context.audioRecordingService.stopRecordingOverride = { _ in [] }
+
+        _ = context.dictationViewModel.apiStartRecording()
+        await fulfillment(of: [audioStartEntered], timeout: 1)
+        context.audioRecordingService.cancelPendingRecordingStart()
+        XCTAssertEqual(volume.volume, 0)
+        XCTAssertTrue(volume.writes.isEmpty)
+        audioStartGate.signal()
+        await context.dictationViewModel.testingWaitForRecordingStart()
+
+        XCTAssertFalse(context.audioRecordingService.isRecording)
+        XCTAssertEqual(volume.volume, 0.75, accuracy: 0.0001)
+        XCTAssertEqual(volume.writes, [0.75])
+
+        context.dictationViewModel.handleCancelHotkey()
+        context.dictationViewModel.handleCancelHotkey()
+        await context.dictationViewModel.testingWaitForRecordingCleanup()
+        XCTAssertEqual(volume.writes, [0.75], "The cancelled startup must clear its saved snapshot")
     }
 
     @MainActor
@@ -11750,6 +13115,7 @@ final class TypeWhisperIntegrationTests: XCTestCase {
             dictionaryService: dictionaryService,
             dictationViewModel: dictationViewModel,
             audioRecorderViewModel: audioRecorderViewModel,
+            audioDeviceService: audioDeviceService,
             settingsBackupService: settingsBackupService
         )
         handlers.register(on: router)
@@ -14255,6 +15621,37 @@ final class TypeWhisperIntegrationTests: XCTestCase {
             XCTAssertTrue(fixture.files(pluginId: "com.typewhisper.groq").isEmpty)
             XCTAssertTrue(fixture.defaults(pluginId: "com.typewhisper.groq").isEmpty)
         }
+    }
+
+    func testTestHostDoesNotUseTheDevAppDataDirectory() {
+        let savedOverride = AppConstants.testAppSupportDirectoryOverride
+        AppConstants.testAppSupportDirectoryOverride = nil
+        defer { AppConstants.testAppSupportDirectoryOverride = savedOverride }
+
+        XCTAssertTrue(AppConstants.isRunningTests)
+        XCTAssertEqual(AppConstants.appSupportDirectory, AppConstants.testHostAppSupportDirectory)
+        XCTAssertNotEqual(AppConstants.appSupportDirectory, AppConstants.defaultAppSupportDirectory)
+        XCTAssertTrue(
+            AppConstants.appSupportDirectory.standardizedFileURL.path
+                .hasPrefix(FileManager.default.temporaryDirectory.standardizedFileURL.path)
+        )
+    }
+
+    func testTestBundleRestoresTheDevAppEngineSelectionAfterEachTest() throws {
+        XCTAssertTrue(Bundle(for: TestHostDefaultsGuard.self).principalClass == TestHostDefaultsGuard.self)
+
+        let suiteName = "TestHostDefaultsGuardTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        defaults.set("parakeet", forKey: UserDefaultsKeys.selectedEngine)
+        let defaultsGuard = TestHostDefaultsGuard(defaults: defaults)
+
+        defaults.set("mock-restore-after-unload", forKey: UserDefaultsKeys.selectedEngine)
+        defaults.set("tiny", forKey: UserDefaultsKeys.selectedModelId)
+        defaultsGuard.testCaseDidFinish(self)
+
+        XCTAssertEqual(defaults.string(forKey: UserDefaultsKeys.selectedEngine), "parakeet")
+        XCTAssertNil(defaults.object(forKey: UserDefaultsKeys.selectedModelId))
     }
 
     func testScreenshotAppSupportOverrideMustStayInsideTemporaryDirectory() {
@@ -17855,6 +19252,126 @@ final class HotkeyServiceCompatibilityTests: XCTestCase {
         XCTAssertTrue(service.isEventTapEnabledForTesting)
     }
 
+    #if !APPSTORE
+    // The App Store edition's listen-only tap never waits for the main thread.
+    func testEventTapReleasesInputWhileMainThreadIsBlocked() throws {
+        let service = HotkeyService()
+        service.suspendMonitoring()
+        defer { service.suspendMonitoring() }
+        service.isCancellationAvailable = true
+        var cancelCount = 0
+        service.onCancelPressed = { cancelCount += 1 }
+        nonisolated(unsafe) let escapeDown = try XCTUnwrap(
+            CGEvent(keyboardEventSource: nil, virtualKey: 0x35, keyDown: true)
+        )
+        final class Answers: @unchecked Sendable {
+            var suppressed: [Bool] = []
+            var durations: [TimeInterval] = []
+        }
+        let answers = Answers()
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            for _ in 0..<2 {
+                let start = Date()
+                answers.suppressed.append(service.decideEventTapEventForTesting(escapeDown))
+                answers.durations.append(Date().timeIntervalSince(start))
+            }
+            finished.signal()
+        }
+        // Deliberately block the main thread: the tap must give up on it instead of holding input.
+        XCTAssertEqual(finished.wait(timeout: .now() + 2), .success)
+        XCTAssertEqual(answers.suppressed, [false, false])
+        XCTAssertLessThan(answers.durations[0], 0.5)
+        XCTAssertLessThan(answers.durations[1], 0.05, "A known stall must release input without waiting")
+
+        // Released events are left to the NSEvent monitors; the late main-thread work must not act on them.
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(cancelCount, 0)
+
+        DispatchQueue.global().async {
+            answers.suppressed.append(service.decideEventTapEventForTesting(escapeDown))
+            finished.signal()
+        }
+        let deadline = Date().addingTimeInterval(2)
+        while finished.wait(timeout: .now()) == .timedOut, Date() < deadline {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.01))
+        }
+        XCTAssertEqual(answers.suppressed, [false, false, true], "A responsive main thread decides again")
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        XCTAssertEqual(cancelCount, 1)
+    }
+    #endif
+
+    func testEventTapGateWaitsForClaimedHandlerWithinItsOwnBound() throws {
+        let gate = HotkeyService.EventTapMainThreadGate()
+        let decision = try XCTUnwrap(gate.makeDecision())
+        XCTAssertEqual(gate.claim(decision), .handle)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.1) {
+            gate.resolve(decision, suppress: true)
+        }
+        // Picked up before the first deadline, finished after it: the handler's decision stands.
+        let answer = gate.wait(
+            for: decision,
+            requestedAt: DispatchTime.now().uptimeNanoseconds,
+            timeout: 0.05,
+            claimedTimeout: 1
+        )
+        XCTAssertEqual(answer, .decided(suppress: true))
+        XCTAssertNotNil(gate.makeDecision(), "A finished handler must not leave a stall behind")
+    }
+
+    func testEventTapGateTreatsAbandonedHandlerAsStall() throws {
+        let gate = HotkeyService.EventTapMainThreadGate()
+        let decision = try XCTUnwrap(gate.makeDecision())
+        XCTAssertEqual(gate.claim(decision), .handle)
+        let start = Date()
+        let answer = gate.wait(
+            for: decision,
+            requestedAt: DispatchTime.now().uptimeNanoseconds,
+            timeout: 0.05,
+            claimedTimeout: 0.05
+        )
+        XCTAssertEqual(answer, .released(stallStarted: true))
+        XCTAssertLessThan(Date().timeIntervalSince(start), 0.5, "One deadline covers both waits")
+        XCTAssertNil(gate.makeDecision(), "Later events pass at once while the handler is stuck")
+
+        let stall = try XCTUnwrap(gate.resolve(decision, suppress: true))
+        XCTAssertEqual(stall.releasedEvents, 2)
+        XCTAssertNotNil(gate.makeDecision(), "The late handler ends the stall")
+    }
+
+    func testEventTapReenableBackoffAfterRepeatedTimeouts() {
+        let second: UInt64 = 1_000_000_000
+        var backoff = HotkeyService.EventTapReenableBackoff()
+        XCTAssertEqual(backoff.recordTimeout(at: 0), .reenable)
+        XCTAssertEqual(backoff.recordTimeout(at: 40 * second), .reenable, "Timeouts outside the window do not add up")
+        XCTAssertEqual(backoff.recordTimeout(at: 50 * second), .reenable)
+        XCTAssertEqual(backoff.recordTimeout(at: 60 * second), .backingOff(seconds: 30))
+        XCTAssertFalse(backoff.allowsReenable(at: 89 * second))
+        XCTAssertEqual(backoff.recordTimeout(at: 89 * second), .backingOff(seconds: nil))
+        XCTAssertTrue(backoff.allowsReenable(at: 90 * second))
+
+        // Timeouts soon after a backoff double the next one.
+        XCTAssertEqual(backoff.recordTimeout(at: 91 * second), .reenable)
+        XCTAssertEqual(backoff.recordTimeout(at: 92 * second), .reenable)
+        XCTAssertEqual(backoff.recordTimeout(at: 93 * second), .backingOff(seconds: 60))
+
+        // A long quiet period starts over.
+        XCTAssertEqual(backoff.recordTimeout(at: 1_000 * second), .reenable)
+        XCTAssertEqual(backoff.recordTimeout(at: 1_001 * second), .reenable)
+        XCTAssertEqual(backoff.recordTimeout(at: 1_002 * second), .backingOff(seconds: 30))
+
+        // The quiet period also counts when a lone timeout followed the last backoff.
+        var lone = HotkeyService.EventTapReenableBackoff()
+        for t: UInt64 in [0, 1, 2] { _ = lone.recordTimeout(at: t * second) }
+        for t: UInt64 in [33, 34] { _ = lone.recordTimeout(at: t * second) }
+        XCTAssertEqual(lone.recordTimeout(at: 35 * second), .backingOff(seconds: 60))
+        XCTAssertEqual(lone.recordTimeout(at: 96 * second), .reenable)
+        XCTAssertEqual(lone.recordTimeout(at: 4_000 * second), .reenable)
+        XCTAssertEqual(lone.recordTimeout(at: 4_001 * second), .reenable)
+        XCTAssertEqual(lone.recordTimeout(at: 4_002 * second), .backingOff(seconds: 30))
+    }
+
     @MainActor
     func testRecoveryStopsWorkflowAfterLostRelease() async throws {
         let service = HotkeyService()
@@ -20418,4 +21935,179 @@ final class HotkeyServiceCompatibilityTests: XCTestCase {
             modifierFlags: isDown ? [.function] : []
         )
     }
+}
+
+extension TypeWhisperIntegrationTests {
+    @MainActor
+    func testCalendarAutoStopSurvivesDeniedNotificationsAndRelaunchRefresh() async throws {
+        try await exerciseMeetingAutoStopWithoutNotifications(adHoc: false, browser: false)
+    }
+
+    @MainActor
+    func testAdHocMeetingWithoutCalendarKeepsAutoStopAndContinueAction() async throws {
+        try await exerciseMeetingAutoStopWithoutNotifications(adHoc: true, browser: false)
+    }
+
+    @MainActor
+    func testBackgroundMeetingTabAndFailedNotificationKeepContinueAction() async throws {
+        try await exerciseMeetingAutoStopWithoutNotifications(adHoc: true, browser: true)
+    }
+
+    @MainActor
+    private func exerciseMeetingAutoStopWithoutNotifications(adHoc: Bool, browser: Bool) async throws {
+        let directory = try TestSupport.makeTemporaryDirectory()
+        let suite = "MeetingRuntime-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer {
+            defaults.removePersistentDomain(forName: suite)
+            TestSupport.remove(directory)
+            MockTranscriptionPlugin.reset()
+        }
+        defaults.set(CalendarMeetingStartMode.automatic.rawValue, forKey: UserDefaultsKeys.calendarMeetingStartMode)
+        defaults.set(true, forKey: UserDefaultsKeys.calendarMeetingAutoStopEnabled)
+        defaults.set(adHoc, forKey: UserDefaultsKeys.calendarMeetingDetectAdHoc)
+        let context = Self.makeDictationContext(appSupportDirectory: directory)
+        let recorderService = AudioRecorderService()
+        recorderService.recordingsDirectoryOverride = directory
+        recorderService.startRecordingOverride = { _, _, _, proposedURL, _ in
+            try Data("recording".utf8).write(to: proposedURL)
+            return proposedURL
+        }
+        recorderService.stopRecordingOverride = { $0 }
+        let recorder = AudioRecorderViewModel(
+            recorderService: recorderService,
+            modelManager: context.modelManager,
+            dictionaryService: context.dictionaryService,
+            audioDeviceService: AudioDeviceService(initialInputDevices: [], monitorDeviceChanges: false),
+            defaults: defaults, recordingsLoader: { _, _ in [] }
+        )
+        recorder.transcriptionEnabled = false
+        recorder.micEnabled = false
+        recorder.systemAudioEnabled = true
+        let countdown = CalendarMeetingCountdownModel()
+        var now = Date(timeIntervalSince1970: 2_000_000_000)
+        let initialTime = now
+        let calendarOccurrence = CalendarMeetingOccurrence(
+            eventIdentifier: "scheduled", occurrenceStart: now, startDate: now,
+            endDate: now.addingTimeInterval(3600), title: "Scheduled test", calendarID: "calendar",
+            participationStatus: .accepted,
+            meetingLinks: [CalendarMeetingCanonicalLink(provider: .zoom, identity: "j/123456789")]
+        )
+        let events = MeetingRuntimeEventProvider(occurrences: adHoc ? [] : [calendarOccurrence])
+        let notifications = MeetingRuntimeNotifications(authorization: browser ? .authorized : .denied)
+        let browserResolver = MeetingRuntimeBrowserResolver()
+        let controller = CalendarMeetingAutomationController(
+            licenseService: LicenseService(defaults: defaults, keychainServiceName: suite,
+                keychainCopyMatching: { _, _ in errSecItemNotFound }),
+            premiumAccountService: PremiumAccountService(defaults: defaults, keychainService: suite,
+                isSignedInOverride: false, automaticallyRefresh: false, startupTokenReader: { _ in nil }),
+            recorderViewModel: recorder, dictationViewModel: context.dictationViewModel,
+            countdownModel: countdown, defaults: defaults,
+            eventProviderFactory: { events },
+            audioCollectorFactory: { MeetingRuntimeAudioCollector() },
+            cameraCollectorFactory: { MeetingRuntimeCameraCollector() },
+            browserResolverFactory: { browserResolver },
+            notificationServiceFactory: { notifications },
+            premiumAccessProvider: { true }, nowProvider: { now }
+        )
+        defer { controller.shutdown() }
+        await controller.testingRefresh()
+        XCTAssertEqual(controller.calendarAuthorization, adHoc ? .denied : .fullAccess)
+        XCTAssertTrue(controller.isAutomationActive)
+        XCTAssertTrue(controller.autoStopEnabled, "Permission refresh must not erase the saved preference")
+        XCTAssertTrue(controller.canEnableAutoStop)
+        XCTAssertTrue(defaults.bool(forKey: UserDefaultsKeys.calendarMeetingAutoStopEnabled))
+
+        let process = MeetingAudioProcess(audioObjectID: 1, processID: 123,
+            bundleIdentifier: browser ? SupportedMeetingBrowser.chrome : "us.zoom.xos",
+            isRunningInput: true, isRunningOutput: true)
+        await controller.testingActivity(MeetingActivitySnapshot(capturedAt: now, availability: .available, processes: [process]))
+        now = initialTime.addingTimeInterval(adHoc ? (browser ? 20 : 5) : 3)
+        await controller.testingAdvanceTime()
+        XCTAssertEqual(countdown.presentation?.kind.isStart, true)
+        now = now.addingTimeInterval(5)
+        await controller.testingAdvanceTime()
+        XCTAssertEqual(recorder.state, .recording)
+        XCTAssertNil(countdown.presentation)
+
+        // Switching away from the meeting did not prevent the start; removing
+        // its background tab is observed even though browser audio is unchanged.
+        if browser {
+            await browserResolver.removeMeetingTab()
+            await controller.testingAdvanceTime()
+        } else {
+            await controller.testingActivity(MeetingActivitySnapshot(capturedAt: now,
+                availability: .available, processes: []))
+        }
+        if adHoc {
+            XCTAssertNil(countdown.presentation)
+            now = now.addingTimeInterval(90)
+            await controller.testingAdvanceTime()
+        }
+        XCTAssertEqual(countdown.presentation?.kind, .autoStop)
+        XCTAssertEqual(notifications.autoStopAttempts, 1)
+        XCTAssertTrue(controller.autoStopEnabled)
+        XCTAssertTrue(defaults.bool(forKey: UserDefaultsKeys.calendarMeetingAutoStopEnabled))
+        countdown.continueRecording()
+        XCTAssertNil(countdown.presentation)
+        now = now.addingTimeInterval(200)
+        await controller.testingAdvanceTime()
+        XCTAssertEqual(recorder.state, .recording, "The in-app veto survives failed notification delivery")
+        recorder.stopRecording()
+        for _ in 0..<100 where recorder.state != .idle {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(recorder.state, .idle)
+    }
+}
+
+private actor MeetingRuntimeEventProvider: CalendarMeetingEventProviding {
+    let values: [CalendarMeetingOccurrence]
+    init(occurrences: [CalendarMeetingOccurrence]) { values = occurrences }
+    func authorizationStatus() -> CalendarMeetingCalendarAuthorization { values.isEmpty ? .denied : .fullAccess }
+    func requestFullAccess() -> Bool { false }
+    func calendars() -> [CalendarMeetingCalendar] {
+        [CalendarMeetingCalendar(id: "calendar", title: "Test", sourceTitle: "Local")]
+    }
+    func occurrences(in interval: DateInterval, calendarIDs: Set<String>) -> [CalendarMeetingOccurrence] { values }
+    func changes() -> AsyncStream<Void> { AsyncStream { _ in } }
+}
+
+private actor MeetingRuntimeAudioCollector: MeetingAudioActivityCollecting {
+    func startCollecting() -> AsyncStream<MeetingActivitySnapshot> { AsyncStream { _ in } }
+    func stopCollecting() {}
+}
+
+private actor MeetingRuntimeCameraCollector: MeetingCameraActivityCollecting {
+    func startCollecting() -> AsyncStream<MeetingCameraActivitySnapshot> { AsyncStream { _ in } }
+    func stopCollecting() {}
+}
+
+private actor MeetingRuntimeBrowserResolver: BrowserURLResolving {
+    private var hasMeeting = true
+    func removeMeetingTab() { hasMeeting = false }
+    func activeURL(for bundleIdentifier: String) -> URL? { URL(string: "https://example.com/document") }
+    func meetingTabURLs(for bundleIdentifier: String) -> [URL]? {
+        var urls = [URL(string: "https://example.com/document")!]
+        if hasMeeting { urls.append(URL(string: "https://meet.google.com/abc-defg-hij")!) }
+        return urls
+    }
+}
+
+@MainActor
+private final class MeetingRuntimeNotifications: CalendarMeetingNotifying {
+    let authorization: CalendarMeetingNotificationAuthorization
+    private(set) var autoStopAttempts = 0
+    init(authorization: CalendarMeetingNotificationAuthorization) { self.authorization = authorization }
+    func installRouter(responseHandler: @escaping @MainActor (CalendarMeetingNotificationResponse) -> Void) {}
+    func configureAndRequestAuthorization() async -> CalendarMeetingNotificationAuthorization { authorization }
+    func refreshAuthorizationStatus() async {}
+    func replaceScheduledReminders(_ occurrences: [CalendarMeetingOccurrence], startMode: CalendarMeetingStartMode, now: Date) async {}
+    func publishDetectedMeeting(_ occurrence: CalendarMeetingOccurrence, now: Date) async {}
+    func publishAutoStopWarning(occurrenceDigest: String, now: Date) async -> Bool {
+        autoStopAttempts += 1
+        return false
+    }
+    func removeAutoStopWarning(occurrenceDigest: String) {}
+    func removeScheduledMeetingRequests() async {}
 }

@@ -17,6 +17,7 @@ var engineOverride: String?
 var modelOverride: String?
 var awaitDownload = false
 var applyCorrections = true
+var replaceExisting = false
 
 var argIterator = args.makeIterator()
 while let arg = argIterator.next() {
@@ -83,13 +84,16 @@ while let arg = argIterator.next() {
         awaitDownload = true
     case "--no-corrections":
         applyCorrections = false
+    case "--replace":
+        replaceExisting = true
     default:
         // Ignore Apple/Xcode internal flags (e.g. -NSDocumentRevisionsDebugMode)
         if arg.hasPrefix("-NS") || arg.hasPrefix("-Apple") {
             _ = argIterator.next() // skip value if present
             continue
         }
-        if arg.hasPrefix("-") && command != nil {
+        // A bare "-" is the positional stdin marker, not an option.
+        if arg.hasPrefix("-") && arg != "-" && command != nil {
             printError("Error: Unknown option '\(arg)'.")
             exit(1)
         }
@@ -146,8 +150,32 @@ do {
             throw CLIError.fileNotFound(fileURL.path)
         }
         let backupData = try Data(contentsOf: fileURL)
-        let result = try await client.importSettings(backupData)
+        let result = try await client.importSettings(backupData, replaceExisting: replaceExisting)
         print(OutputFormatter.formatSettingsImport(result, json: jsonOutput))
+
+    case "audio":
+        let data: Data
+        switch positionalArgs.first {
+        case nil:
+            data = try await client.audioSettings()
+        case "set" where positionalArgs.count == 2:
+            let changes: Data
+            if positionalArgs[1] == "-" {
+                changes = FileHandle.standardInput.readDataToEndOfFile()
+                guard !changes.isEmpty else { throw CLIError.stdinEmpty }
+            } else {
+                let fileURL = settingsFileURL(for: positionalArgs[1])
+                guard FileManager.default.fileExists(atPath: fileURL.path) else {
+                    throw CLIError.fileNotFound(fileURL.path)
+                }
+                changes = try Data(contentsOf: fileURL)
+            }
+            data = try await client.updateAudioSettings(changes)
+        default:
+            printError("Error: Use 'audio' to show audio settings or 'audio set <file>' to change them.")
+            exit(1)
+        }
+        print(OutputFormatter.formatAudioSettings(data, json: jsonOutput))
 
     case "transcribe":
         let fileURL: URL?
@@ -206,6 +234,8 @@ func printUsage() {
           models               List available models
           export <file>        Export a settings backup as JSON
           import <file>        Import all settings from a JSON backup
+          audio                Show microphone priority, ducking and sound settings
+          audio set <file>     Change audio settings from a JSON file (or - for stdin)
 
         Global options:
           --port <N>           Server port (default: auto-detect)
@@ -225,10 +255,17 @@ func printUsage() {
           --await-download     Wait for an engine to restore/download its model instead of failing with 409
           --no-corrections     Return raw transcription text without Dictionary Corrections
 
+        Import options:
+          --replace            Overwrite workflows, profiles, and prompt actions with the
+                               same name and replace hotkeys (default: only add new items)
+
         Examples:
           typewhisper status
           typewhisper export typewhisper-settings.json
           typewhisper import typewhisper-settings.json
+          typewhisper import typewhisper-settings.json --replace
+          typewhisper audio --json
+          echo '{"audio_ducking_enabled": false}' | typewhisper audio set -
           typewhisper transcribe recording.wav
           typewhisper transcribe recording.wav --language de --json
           typewhisper transcribe recording.wav --language-hint de --language-hint en

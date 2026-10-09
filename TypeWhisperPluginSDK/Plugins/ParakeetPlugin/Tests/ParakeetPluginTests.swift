@@ -18,6 +18,40 @@ final class ParakeetPluginTests: XCTestCase {
         }
     }
 
+    /// Records CTC download hook calls; the first call can be held until released.
+    private actor CtcDownloadRecorder {
+        private(set) var events: [String] = []
+        private var holdsFirstDownload: Bool
+        private var firstDownloadRelease: CheckedContinuation<Void, Never>?
+        private var startWaiter: CheckedContinuation<Void, Never>?
+
+        init(holdsFirstDownload: Bool = false) {
+            self.holdsFirstDownload = holdsFirstDownload
+        }
+
+        func download(loadIntoMemory: Bool) async {
+            let kind = loadIntoMemory ? "load" : "files"
+            events.append("start \(kind)")
+            startWaiter?.resume()
+            startWaiter = nil
+            if holdsFirstDownload {
+                holdsFirstDownload = false
+                await withCheckedContinuation { firstDownloadRelease = $0 }
+            }
+            events.append("end \(kind)")
+        }
+
+        func waitForFirstStart() async {
+            guard events.isEmpty else { return }
+            await withCheckedContinuation { startWaiter = $0 }
+        }
+
+        func releaseFirstDownload() {
+            firstDownloadRelease?.resume()
+            firstDownloadRelease = nil
+        }
+    }
+
     private actor VocabularyFetchRecorder {
         private var requests: [(url: URL, description: String)] = []
         private let data: Data?
@@ -90,6 +124,55 @@ final class ParakeetPluginTests: XCTestCase {
         let result = try await plugin.transcribe(audio: audio, language: nil, translate: false, prompt: nil)
         XCTAssertTrue(result.text.contains("work we've done?"), result.text)
         XCTAssertTrue(result.text.hasSuffix("cutting a release?"), result.text)
+    }
+
+    /// Opt-in: any 16 kHz mono WAV in `TYPEWHISPER_PARAKEET_WORD_TIMING_WAV`
+    /// and an installed Parakeet v3 model.
+    func testInstalledV3ModelReportsWordTimingsToTheHostCollector() async throws {
+        guard let path = ProcessInfo.processInfo.environment["TYPEWHISPER_PARAKEET_WORD_TIMING_WAV"] else {
+            throw XCTSkip("Set TYPEWHISPER_PARAKEET_WORD_TIMING_WAV and install Parakeet v3 to run Core ML inference")
+        }
+        let url = URL(fileURLWithPath: path)
+        let file = try AVAudioFile(forReading: url)
+        XCTAssertEqual(file.processingFormat.sampleRate, 16_000)
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(
+            pcmFormat: file.processingFormat,
+            frameCapacity: AVAudioFrameCount(file.length)
+        ))
+        try file.read(into: buffer)
+        let channel = try XCTUnwrap(buffer.floatChannelData?[0])
+        let samples = Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+        let audio = AudioData(samples: samples, wavData: try Data(contentsOf: url), duration: Double(samples.count) / 16_000)
+
+        let host = try PluginTestHostServices(defaults: [
+            "loadedModel": "parakeet-tdt-0.6b-v3",
+            "vocabularyBoostingEnabled": false,
+        ])
+        let plugin = makePlugin()
+        plugin.activate(host: host)
+        defer { plugin.deactivate() }
+        await plugin.restoreLoadedModel(allowDownloads: false, passively: true)
+        guard plugin.isConfigured else {
+            XCTFail("Installed Parakeet v3 failed to load: \(plugin.modelState)")
+            return
+        }
+
+        let collector = PluginWordTimingCollector()
+        let result = try await PluginWordTimings.$collector.withValue(collector) {
+            try await plugin.transcribe(audio: audio, language: nil, translate: false, prompt: nil)
+        }
+        let words = collector.words
+
+        XCTAssertFalse(words.isEmpty)
+        XCTAssertEqual(words.map(\.text).joined(separator: " "), result.segments.map(\.text).joined(separator: " "))
+        XCTAssertTrue(zip(words, words.dropFirst()).allSatisfy { $0.start <= $1.start })
+        XCTAssertTrue(words.allSatisfy { $0.end >= $0.start && $0.end <= audio.duration + 0.5 })
+        print("Parakeet reported \(words.count) words in \(result.segments.count) segments")
+        if let dump = ProcessInfo.processInfo.environment["TYPEWHISPER_PARAKEET_WORD_TIMING_DUMP"] {
+            let lines = result.segments.map { "S\t\($0.start)\t\($0.end)\t\($0.text)" }
+                + words.map { "W\t\($0.start)\t\($0.end)\t\($0.text)" }
+            try lines.joined(separator: "\n").write(toFile: dump, atomically: true, encoding: .utf8)
+        }
     }
 
     func testInstalledV3ModelPreservesTextWithUnrelatedDictionaryTerms() async throws {
@@ -632,6 +715,88 @@ final class ParakeetPluginTests: XCTestCase {
         plugin.setBoostingEnabled(true)
 
         XCTAssertEqual(host.capabilitiesChangedCount, 1)
+    }
+
+    func testEnablingDictionaryTermsSettingTurnsOnBoostingAndDownloadsFilesOnlyWhileUnloaded() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = makePlugin()
+        plugin.activate(host: host)
+        let recorder = CtcDownloadRecorder()
+        plugin.ctcModelDownloadOverrideForTests = { loadIntoMemory in
+            XCTAssertEqual(plugin.dictionaryTermsSupport, .supported)
+            await recorder.download(loadIntoMemory: loadIntoMemory)
+        }
+
+        XCTAssertTrue((plugin as Any) is any DictionaryTermsSettingEnabling)
+        XCTAssertFalse(plugin.dictionaryTermsSettingSummary.isEmpty)
+        XCTAssertEqual(plugin.dictionaryTermsSupport, .requiresPluginSetting)
+
+        try await plugin.enableDictionaryTermsSetting()
+
+        let events = await recorder.events
+        XCTAssertEqual(events, ["start files", "end files"])
+        XCTAssertEqual(plugin.dictionaryTermsSupport, .supported)
+        XCTAssertEqual(host.userDefault(forKey: "vocabularyBoostingEnabled") as? Bool, true)
+        XCTAssertEqual(host.capabilitiesChangedCount, 2)
+    }
+
+    func testEnablingDictionaryTermsSettingThrowsDownloadFailureAndKeepsBoostingOn() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = makePlugin()
+        plugin.activate(host: host)
+        plugin.ctcModelDownloadOverrideForTests = { _ in
+            plugin.ctcModelState = .error("Not enough disk space")
+        }
+
+        do {
+            try await plugin.enableDictionaryTermsSetting()
+            XCTFail("Expected the download failure to be thrown")
+        } catch let error as ParakeetVocabularyBoostingError {
+            XCTAssertEqual(error.localizedDescription, "Not enough disk space")
+        }
+
+        // Same as the settings toggle: boosting stays on and the download is retried later.
+        XCTAssertEqual(plugin.dictionaryTermsSupport, .supported)
+        XCTAssertEqual(plugin.currentSettingsActivity?.isError, true)
+        XCTAssertEqual(host.capabilitiesChangedCount, 1)
+
+        plugin.ctcModelDownloadOverrideForTests = { _ in
+            plugin.ctcModelState = .notDownloaded
+        }
+        try await plugin.enableDictionaryTermsSetting()
+        XCTAssertEqual(host.capabilitiesChangedCount, 2)
+    }
+
+    func testCtcDownloadsFromEnablingAndFirstUseRunOneAfterAnother() async throws {
+        let host = try PluginTestHostServices()
+        let plugin = makePlugin()
+        plugin.activate(host: host)
+        let recorder = CtcDownloadRecorder(holdsFirstDownload: true)
+        plugin.ctcModelDownloadOverrideForTests = { loadIntoMemory in
+            await recorder.download(loadIntoMemory: loadIntoMemory)
+        }
+
+        let enabling = Task { try await plugin.enableDictionaryTermsSetting() }
+        await recorder.waitForFirstStart()
+
+        // A first transcription asks for the in-memory model while the files download.
+        let firstUse = Task { await plugin.downloadCtcModel() }
+        var yields = 0
+        while await plugin.ctcDownloadGate.waitingCount == 0, yields < 10_000 {
+            await Task.yield()
+            yields += 1
+        }
+        let waitingCount = await plugin.ctcDownloadGate.waitingCount
+        XCTAssertEqual(waitingCount, 1)
+        let eventsWhileHeld = await recorder.events
+        XCTAssertEqual(eventsWhileHeld, ["start files"])
+
+        await recorder.releaseFirstDownload()
+        try await enabling.value
+        await firstUse.value
+
+        let events = await recorder.events
+        XCTAssertEqual(events, ["start files", "end files", "start load", "end load"])
     }
 
     func testDisablingVocabularyBoostingPersistsClearsVocabularyAndHidesCtcActivity() throws {

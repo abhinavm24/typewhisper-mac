@@ -9,13 +9,14 @@ on-device AI models or cloud APIs (Groq, OpenAI, xAI/Grok), then transform the
 result with reusable workflows. Your voice data stays on your Mac with local
 models - or use cloud APIs for faster processing.
 
-TypeWhisper `1.6` is the current stable release for macOS. It adds a redesigned
-Settings experience, privacy-friendly statistics and portable backups, faster
-and more resilient recording, calendar-aware meeting automation, expanded
-workflow integrations, Simplified Chinese localization, and reliability
-improvements across dictation, Recorder, local models, and cloud providers.
+TypeWhisper `1.7.0` is the current stable release for macOS. It adds iCloud sync
+for History and Inbox, a visual keyboard shortcut editor, Undo Last Dictation
+and Restore Raw Transcript, new indicator styles, expanded dictation recovery,
+Finder transcription, and compatible local model imports.
 
-See the [1.6.0 release notes](docs/release-notes/1.6.0.md),
+Development on `main` targets `1.8`; daily builds use the `v1.8.0-daily.*` line.
+
+See the [1.7.0 release notes](docs/release-notes/1.7.0.md),
 [release readiness guide](docs/release-readiness.md),
 [support matrix](docs/support-matrix.md), and
 [release validation process](docs/release-checklist.md) for the shipped feature
@@ -211,13 +212,13 @@ brew install --cask typewhisper/tap/typewhisper
 
 Download the latest DMG from [GitHub Releases](https://github.com/TypeWhisper/typewhisper-mac/releases/latest).
 
-Stable direct-download releases use the default Sparkle channel. Release candidates such as `1.6.0-rc*` and daily builds such as `v1.6.0-daily.*` are published as GitHub prereleases, update the shared Sparkle appcast on their own channels, and are excluded from Homebrew.
+Stable direct-download releases use the default Sparkle channel. Release candidates and daily builds are published as GitHub prereleases, update the shared Sparkle appcast on their own channels, and are excluded from Homebrew.
 Installed builds can switch channels in `Settings -> About` via the `Update Channel` picker.
 
 ## Quick Start
 
 1. Install TypeWhisper from Homebrew or the latest DMG.
-2. Open Settings and grant Microphone plus Accessibility access.
+2. Open Settings and grant Microphone plus Accessibility access (System Settings > Privacy & Security > Accessibility, named Device Control and Data Access on macOS 27 and later).
 3. Pick an engine and, if needed, download a local model.
 4. Trigger the global hotkey and complete your first dictation.
 
@@ -316,6 +317,21 @@ The HTTP API is an advanced local automation surface. It binds to `127.0.0.1` on
 
 Enable the API server in Settings > Advanced (default port: `8978`).
 
+### Authentication
+
+The API server requires a bearer token by default. TypeWhisper creates the token once, keeps it in the Keychain, and writes it to an owner-only discovery file while the server runs. The command line tool, the Raycast extension, the MCP server, and the Pi extension read it automatically. Scripts can read it like this:
+
+```bash
+TYPEWHISPER_API_TOKEN="$(jq -r '.token' "$HOME/Library/Application Support/TypeWhisper/api-discovery.json")"
+curl -H "Authorization: Bearer $TYPEWHISPER_API_TOKEN" http://localhost:8978/v1/models
+```
+
+The `X-TypeWhisper-API-Token` header works as well. Every endpoint except `GET /v1/status` needs the token; the examples below leave the header out for brevity. Settings > Advanced > Copy API Token copies it to the clipboard.
+
+If the API server is turned on without a token when you update to 1.8.0, it keeps running without one until **Require API Token** is turned on, and Settings shows a warning. A server that was off during the update requires the token once it is turned on.
+
+Independent of the token, the server rejects requests that browsers send on behalf of other websites: a `Host` header other than `127.0.0.1`, `localhost`, or `[::1]`, an `Origin` from a website not served from this Mac (including `null`), and `Sec-Fetch-Site: cross-site` unless the `Origin` is a page served from this Mac. Such requests get `403`. Requests without these headers, such as those from `curl` or scripts, are not affected.
+
 ### Check Status
 
 ```bash
@@ -362,6 +378,8 @@ Optional parameters:
 - `task` - `transcribe` (default) or `translate` (translates to English, WhisperKit only).
 - `target_language` - ISO 639-1 code for translation target language (e.g., `es`, `fr`). Uses Apple Translate.
 - `apply_corrections` - Boolean, default `true`. Set to `false` to return raw transcription text without Dictionary Corrections. For raw body uploads, send `x-apply-corrections: false`.
+- `detect_speakers` - Boolean, default `false`. Adds a `speaker` (`Speaker 1`, `Speaker 2`, …) to each segment of a `verbose_json` response. Needs Premium. For raw body uploads, send `x-detect-speakers: true`.
+- `speaker_count` - Number of speakers, when known. Omit it to detect the number. For raw body uploads, send `x-speaker-count`.
 
 Uploads to `/v1/transcribe` are limited to 256 MiB, including stdin uploads from the CLI. Requests above that size return `413 Payload Too Large`. Local CLI file paths use a direct handoff to the running TypeWhisper app instead of uploading the file bytes.
 
@@ -455,7 +473,7 @@ curl -X DELETE http://localhost:8978/v1/dictionary/corrections \
 
 ### Settings Backup
 
-The settings endpoints use the same JSON backup schema and merge/skip behavior as Settings > Advanced > Backup & Restore. Import applies every category present in the backup. While the API server is running, scripts can read its current bearer token from the owner-only discovery file:
+The settings endpoints use the same JSON backup schema and merge/skip behavior as Settings > Advanced > Backup & Restore. Import applies every category present in the backup. These examples include the bearer token from the discovery file (see [Authentication](#authentication)):
 
 ```bash
 TYPEWHISPER_API_TOKEN="$(jq -r '.token' "$HOME/Library/Application Support/TypeWhisper/api-discovery.json")"
@@ -475,6 +493,67 @@ curl --fail --silent --show-error -X POST http://localhost:8978/v1/settings/impo
   -H "Authorization: Bearer $TYPEWHISPER_API_TOKEN" \
   -H "Content-Type: application/json" \
   --data-binary @typewhisper-settings.json
+
+# Import and overwrite workflows, profiles, prompt actions with the same name and hotkeys
+curl --fail --silent --show-error -X POST "http://localhost:8978/v1/settings/import?mode=replace" \
+  -H "Authorization: Bearer $TYPEWHISPER_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @typewhisper-settings.json
+```
+
+An import skips history entries, workflows, profiles, and prompt actions that already exist unchanged, so importing a backup onto the Mac it came from does not duplicate them. The default `mode=merge` adds everything else and only fills empty hotkey slots. `mode=replace` also overwrites existing workflows, profiles, and prompt actions with the same name and the hotkeys contained in the backup. Neither mode deletes anything.
+
+### Audio Settings
+
+`GET /v1/settings/audio` returns the microphone priority list and the recording audio options from Settings > Dictation. `PATCH /v1/settings/audio` changes any subset of them through the same code path as the settings window: the change applies to the next recording, persists across restarts, and shows up in the open settings window. TypeWhisper for Windows serves the same contract.
+
+```bash
+# Show available inputs, the priority list, and the input the next recording would use
+curl http://localhost:8978/v1/settings/audio
+
+# Record from BlackHole and turn off ducking
+curl -X PATCH http://localhost:8978/v1/settings/audio \
+  -H "Content-Type: application/json" \
+  -d '{"input_priority":[{"id":"BlackHole2ch_UID","name":"BlackHole 2ch"}],"audio_ducking_enabled":false}'
+
+# Use the macOS default input
+curl -X PATCH http://localhost:8978/v1/settings/audio \
+  -H "Content-Type: application/json" \
+  -d '{"input_priority":[]}'
+```
+
+```json
+{
+  "input_devices": [{"id": "BlackHole2ch_UID", "name": "BlackHole 2ch", "is_system_default": false}],
+  "input_priority": [{"id": "AppleUSBAudioEngine:HyperX:QuadCast 2", "name": "HyperX QuadCast 2"}],
+  "active_input": {"id": "BuiltInMicrophoneDevice", "name": "MacBook Pro Microphone"},
+  "audio_ducking_enabled": true,
+  "audio_ducking_level": 0.2,
+  "pause_media_during_recording": false,
+  "sound_feedback_enabled": true
+}
+```
+
+| Field | Writable | Description |
+|-------|----------|-------------|
+| `input_devices` | no | Input devices that are connected now. `id` is the CoreAudio device UID. |
+| `input_priority` | yes | The saved priority list, including devices that are not connected. Each entry needs an `id`; `name` is optional and is replaced by the current name while the device is connected. `[]` records from the macOS default input. |
+| `active_input` | no | The input the next recording would use: the first connected entry of `input_priority`, otherwise the macOS default input. `null` when there is no input. |
+| `audio_ducking_enabled` | yes | Reduce the system volume during recording. |
+| `audio_ducking_level` | yes | Share of the current volume kept during recording, from `0` (mute) to `1`. The settings slider offers 0 to 0.5. |
+| `pause_media_during_recording` | yes | Pause media playback during recording. |
+| `sound_feedback_enabled` | yes | Play start, success, and error sounds. |
+
+A successful `PATCH` returns the full state, as `GET` does. It returns `400` for invalid JSON, a value of the wrong type or range, a duplicate or empty device ID, a read-only field, or an unknown field; in that case nothing changes. TypeWhisper for macOS supports every writable field of the shared contract. A field that only another platform offers is an unknown field here, and the error message names it together with the fields macOS accepts. While a dictation or the recorder is recording or still processing, `PATCH` returns `409` and changes nothing; `GET` keeps working.
+
+To change the settings temporarily, save the `GET` response, send your changes, and later send the saved writable fields back:
+
+```bash
+saved="$(curl --fail --silent http://localhost:8978/v1/settings/audio)"
+# ... change settings, record ...
+jq 'del(.input_devices, .active_input)' <<<"$saved" | \
+  curl --fail --silent -X PATCH http://localhost:8978/v1/settings/audio \
+    -H "Content-Type: application/json" --data-binary @-
 ```
 
 ### Workflows
@@ -504,6 +583,8 @@ curl "http://localhost:8978/v1/dictation/transcription?id=<uuid>"
 ```
 
 Dictation control records microphone audio for system-wide insertion. A completed dictation session returns text that TypeWhisper can paste back into the active app.
+
+For the last 100 dictations since the app started, the transcription response also contains a `latency` object with the timings of each dictation phase, from the start request to verified insertion and clipboard restoration. It never contains transcript text, audio or app content. Other sessions return `latency: null`.
 
 ### Recorder Control
 
@@ -574,6 +655,54 @@ Conflict and lookup behavior:
 - Polling with a missing or invalid `id` returns `400 Bad Request`.
 - Polling a valid but unknown session id returns `404 Not Found`.
 
+### Completed Recorder Transcripts
+
+`GET /v1/recorder/recordings` returns the latest successfully saved transcript for each recording, including recordings started manually, by the calendar integration, or through the API. Results survive app restarts and do not depend on live preview or an API session.
+
+```bash
+curl "http://localhost:8978/v1/recorder/recordings?since=1791100000.123456"
+```
+
+```json
+{
+  "recordings": [
+    {
+      "source": "recorder",
+      "recording_id": "8F8C1F45-6D03-44D2-A38C-0C4DE4F7E5F7",
+      "completion_id": "59CBC40C-274A-47A9-804C-8774AB504401",
+      "completed_at": 1791100000.123456,
+      "text": "Meeting notes from the recording.",
+      "audio_file": "/Users/alex/Documents/TypeWhisper Recordings/Meeting.m4a",
+      "transcript_file": "/Users/alex/Documents/TypeWhisper Recordings/Meeting.txt"
+    }
+  ]
+}
+```
+
+`since` accepts Unix seconds or an ISO 8601 timestamp and filters **inclusively by successful completion time**, not the recording's start time. Results are ordered oldest completion first. After processing a response, retain its last `completed_at` and deduplicate by `completion_id`; querying inclusively avoids losing completions with equal timestamps. Invalid timestamps return `400`; unreadable completion receipts return `500` so a consumer does not silently advance past them.
+
+Each successful retranscription keeps the `recording_id`, assigns a new `completion_id`, and replaces the previous result. This is a list of the latest saved results, not a revision history. Failed attempts leave the last successful result available. `markdown_file` is included only when a Markdown transcript was saved and still exists; currently that applies to calendar recordings with meeting metadata. Audio and transcript paths refer to existing files.
+
+Completion receipts are saved alongside recordings as `<audio filename>.transcript-ready.json`. A separate `<audio filename>.recording-id.json` preserves the recording ID if the receipt is damaged, so retranscription can repair it without changing the ID. Both files are committed with the transcript and removed when the recording is deleted in TypeWhisper. Existing recordings become available here after their next successful transcription. Recordings without a saved transcript are omitted. The endpoint uses the same API token as the other private routes.
+
+The Plugin SDK emits **`recorderTranscriptReady`** after the transcript and receipt have been saved. It does not emit the dictation `transcriptionCompleted` event or run Recorder Workflows. Event delivery is best effort while TypeWhisper and the plugin are running; use the API to catch up on missed completions.
+
+In **Webhook Notifications**, enable **Also send completed Recorder transcripts** for each destination that should receive this event. The JSON body has the same fields as an entry above. Webhook retries keep the same `completion_id`.
+
+In **Script Runner**, enable **Also run for completed Recorder transcripts** for each export command. Both options default to off, including for existing configurations, and operate independently of dictation rule/workflow filters. Recorder scripts receive the saved original through stdin and these environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `TYPEWHISPER_SOURCE` | `recorder` |
+| `TYPEWHISPER_RECORDING_ID` | Stable recording UUID |
+| `TYPEWHISPER_COMPLETION_ID` | UUID for this successful save |
+| `TYPEWHISPER_COMPLETED_AT` | Completion time in Unix seconds |
+| `TYPEWHISPER_AUDIO_FILE` | Audio file path |
+| `TYPEWHISPER_TRANSCRIPT_FILE` | Plain-text transcript path |
+| `TYPEWHISPER_MARKDOWN_FILE` | Markdown path, when available; otherwise unset |
+
+Recorder scripts export the original transcript independently; stdout is ignored and may be empty. A nonzero exit status is logged as a failure. The existing five-second script timeout applies, so enqueue longer processing in a separate worker. Ordinary dictation scripts continue to transform text through stdout.
+
 ## CLI Tool
 
 TypeWhisper includes a command-line tool for shell-friendly transcription. It is part of the advanced automation surface and connects to the running local API server.
@@ -590,6 +719,8 @@ typewhisper models              # List available models
 typewhisper transcribe file.wav # Transcribe an audio file
 typewhisper export settings.json # Export all supported settings
 typewhisper import settings.json # Import all categories in a backup
+typewhisper audio               # Show microphone priority, ducking and sound settings
+typewhisper audio set changes.json # Change audio settings (see Audio Settings above)
 ```
 
 ### Options
@@ -603,6 +734,7 @@ typewhisper import settings.json # Import all categories in a backup
 | `--task <task>` | `transcribe` (default) or `translate` |
 | `--translate-to <code>` | Target language for translation |
 | `--no-corrections` | Return raw transcription text without Dictionary Corrections |
+| `--replace` | `import` only: overwrite workflows, profiles, and prompt actions with the same name and replace hotkeys |
 
 ### Examples
 
@@ -624,6 +756,12 @@ typewhisper export ~/.config/typewhisper/settings.json
 
 # Restore it and receive a machine-readable import summary
 typewhisper import ~/.config/typewhisper/settings.json --json
+
+# Apply edits made to that file, including changed hotkeys
+typewhisper import ~/.config/typewhisper/settings.json --replace
+
+# Record from BlackHole until you switch back
+echo '{"input_priority":[{"id":"BlackHole2ch_UID"}]}' | typewhisper audio set -
 ```
 
 The CLI requires the API server to be running (Settings > Advanced) and follows the documented command and flag surface for the current stable release.
