@@ -103,6 +103,9 @@ final class ServiceContainer: ObservableObject {
     let calendarMeetingCountdownModel: CalendarMeetingCountdownModel
     let calendarMeetingAutomationController: CalendarMeetingAutomationController
 
+    lazy var workflowVoiceEditingCoordinator = makeWorkflowVoiceEditingCoordinator()
+    lazy var workflowVoiceEditingWindow = WorkflowVoiceEditingWindowController(coordinator: workflowVoiceEditingCoordinator)
+
     // HTTP API
     let httpServer: HTTPServer
     let apiServerViewModel: APIServerViewModel
@@ -526,10 +529,17 @@ final class ServiceContainer: ObservableObject {
         appStorePremiumService.start()
         #endif
 
+        snippetService.connectLegacyVoiceEditingMigration(to: workflowService)
         calendarMeetingAutomationController.initialize()
         historyService.failInterruptedSpeakerTranscripts()
         speakerVoiceProfileService.removeEmbeddingsOfDeletedRecordings()
 
+        dictationViewModel.workflowVoiceEditingIsBusy = { [weak self] in self?.workflowVoiceEditingCoordinator.isBusy ?? false }
+        audioRecorderViewModel.workflowVoiceEditingIsBusy = { [weak self] in self?.workflowVoiceEditingCoordinator.isBusy ?? false }
+        dictationViewModel.onWorkflowVoiceEditing = { [weak self] workflow, target in
+            self?.startWorkflowVoiceEditing(workflow: workflow, target: target)
+        }
+        hotkeyService.onWorkflowVoiceEditingCancel = { [weak self] in self?.workflowVoiceEditingCoordinator.cancel() }
         hotkeyService.setup()
         dictationViewModel.registerInitialTriggerHotkeys()
         usageStatisticsService.backfillFromHistoryIfNeeded {

@@ -1007,7 +1007,7 @@ final class DictationViewModel: ObservableObject {
     }
 
     var canStartAPIRecording: Bool {
-        state == .idle || canReplaceUndeliveredTranscriptOffer
+        (state == .idle || canReplaceUndeliveredTranscriptOffer) && !workflowVoiceEditingIsBusy()
     }
 
     /// The Insert offer stays up for a while, so a new dictation replaces it, as the dictation
@@ -1835,12 +1835,17 @@ final class DictationViewModel: ObservableObject {
         }
     }
 
+    var workflowVoiceEditingIsBusy: () -> Bool = { false }
+    var onWorkflowVoiceEditing: ((Workflow, WorkflowVoiceEditingTarget?) -> Void)? {
+        didSet { promptPaletteHandler.onWorkflowVoiceEditing = onWorkflowVoiceEditing }
+    }
+
     private func startRecording(
         forcedWorkflowId: UUID? = nil,
         sessionID: UUID = UUID(),
         requestUptimeNanoseconds: UInt64 = DispatchTime.now().uptimeNanoseconds
     ) {
-        guard state == .idle else {
+        guard state == .idle, !workflowVoiceEditingIsBusy() else {
             logger.warning("startRecording rejected: state=\(String(describing: self.state), privacy: .public); resetting hotkey state")
             hotkeyService.cancelDictation()
             return
@@ -4821,6 +4826,7 @@ final class DictationViewModel: ObservableObject {
     }
 
     func triggerWorkflowPalette() {
+        guard !workflowVoiceEditingIsBusy() else { return }
         recentTranscriptionPaletteHandler.hide()
         promptPaletteHandler.triggerSelection(currentState: state, soundFeedbackEnabled: soundFeedbackEnabled)
     }
@@ -4829,6 +4835,11 @@ final class DictationViewModel: ObservableObject {
         recentTranscriptionPaletteHandler.hide()
         promptPaletteHandler.hide()
         guard let workflow = workflowService.workflow(id: workflowId) else { return }
+        if workflow.usesVoiceEditing {
+            onWorkflowVoiceEditing?(workflow, nil)
+            return
+        }
+        guard !workflowVoiceEditingIsBusy() else { return }
         promptPaletteHandler.processWorkflowDirectly(
             workflow: workflow,
             currentState: state,

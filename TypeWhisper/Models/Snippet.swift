@@ -12,6 +12,11 @@ final class Snippet {
     var createdAt: Date
     var updatedAt: Date?
     var usageCount: Int
+    // Retained only to recognize data written by the standalone Transform build.
+    var scopeRawValue: String?
+
+    var isDictationSnippet: Bool { scopeRawValue == nil || scopeRawValue == "dictation" }
+    var isLegacyVoiceEditingPrompt: Bool { scopeRawValue == "voiceTransform" || scopeRawValue == "both" }
 
     init(
         id: UUID = UUID(),
@@ -21,7 +26,8 @@ final class Snippet {
         isEnabled: Bool = true,
         createdAt: Date = Date(),
         updatedAt: Date? = nil,
-        usageCount: Int = 0
+        usageCount: Int = 0,
+        scopeRawValue: String? = nil
     ) {
         self.id = id
         self.trigger = trigger
@@ -31,6 +37,7 @@ final class Snippet {
         self.createdAt = createdAt
         self.updatedAt = updatedAt ?? createdAt
         self.usageCount = usageCount
+        self.scopeRawValue = scopeRawValue
     }
 
     var effectiveUpdatedAt: Date {
