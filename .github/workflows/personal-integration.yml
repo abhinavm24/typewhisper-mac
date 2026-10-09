@@ -1,0 +1,207 @@
+name: Build personal DMG on demand
+
+on:
+  push:
+    branches: [personal-ci]
+
+permissions: {}
+concurrency:
+  group: personal-integration
+  cancel-in-progress: true
+
+jobs:
+  assemble:
+    if: github.repository == 'abhinavm24/typewhisper-mac' && github.ref == 'refs/heads/personal-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      build: ${{ steps.assemble.outputs.build }}
+      candidate: ${{ steps.assemble.outputs.candidate }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Test trusted orchestration
+        run: |
+          python3 -m unittest discover -s control/.github/personal-integration -p 'test_*.py' -v
+          python3 control/scripts/test_install_local.py
+          python3 control/scripts/test_update_personal.py
+          python3 control/scripts/test_personal_appcast.py
+          python3 control/scripts/test_request_personal_release.py
+      - name: Snapshot and merge open PRs
+        id: assemble
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ contains(github.event.head_commit.message, '[force]') }}
+        shell: bash
+        run: |
+          args=()
+          if [[ "$FORCE" == true ]]; then args+=(--force); fi
+          python3 control/.github/personal-integration/integrate.py assemble \
+            --control control --work "$RUNNER_TEMP/assembly" --output assembly "${args[@]}"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.assemble.outputs.build == 'true'
+        with:
+          name: personal-source
+          path: assembly/*
+          if-no-files-found: error
+          retention-days: 7
+
+  build:
+    needs: assemble
+    if: needs.assemble.outputs.build == 'true'
+    runs-on: macos-26
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        task: [app-tests, sdk-tests, appstore, dmg]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-source
+          path: assembly
+      - name: Check out exact assembled candidate
+        env:
+          CANDIDATE: ${{ needs.assemble.outputs.candidate }}
+        run: |
+          git init candidate
+          git -C candidate fetch "$GITHUB_WORKSPACE/assembly/candidate.bundle" HEAD
+          git -C candidate checkout --detach FETCH_HEAD
+          test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE"
+      - uses: maxim-lobanov/setup-xcode@ed7a3b1fda3918c0306d1b724322adc0b8cc0a90 # v1.7.0
+        with:
+          xcode-version: '26.6'
+      - name: Install pinned XcodeGen for App Store compile check
+        if: matrix.task == 'appstore'
+        env:
+          XCODEGEN_VERSION: '2.46.0'
+          XCODEGEN_SHA256: 4d9e34b62172d645eed6457cac13fc222569974098ef4ee9c3368bedf0196806
+        run: |
+          archive="$RUNNER_TEMP/xcodegen.zip"
+          curl -fsSL -o "$archive" "https://github.com/yonaskolb/XcodeGen/releases/download/${XCODEGEN_VERSION}/xcodegen.zip"
+          echo "${XCODEGEN_SHA256}  $archive" | shasum -a 256 -c -
+          unzip -q "$archive" -d "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/xcodegen/bin" >> "$GITHUB_PATH"
+      - name: Run ${{ matrix.task }}
+        env:
+          BUILD_TASK: ${{ matrix.task }}
+          PERSONAL_UPDATES_ENABLED: ${{ vars.PERSONAL_UPDATES_ENABLED || 'false' }}
+          PERSONAL_UPDATE_FEED_URL: ${{ vars.PERSONAL_UPDATE_FEED_URL || 'https://abhinavm24.github.io/typewhisper-mac/appcast.xml' }}
+          PERSONAL_UPDATE_PUBLIC_KEY: ${{ vars.PERSONAL_UPDATES_ENABLED == 'true' && vars.PERSONAL_UPDATE_PUBLIC_KEY || '' }}
+        run: bash control/.github/personal-integration/build.sh "$GITHUB_WORKSPACE/candidate" "$GITHUB_WORKSPACE/products" "$BUILD_TASK"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: matrix.task == 'dmg'
+        with:
+          name: personal-dmg
+          path: products/TypeWhisper-personal.dmg
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: personal-${{ matrix.task }}-logs
+          path: products/*.log
+          retention-days: 14
+
+  publish:
+    needs: [assemble, build]
+    concurrency:
+      group: personal-integration-publish
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-source
+          path: assembly
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-dmg
+          path: products
+      - name: Verify inputs and publish personal prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 control/.github/personal-integration/integrate.py publish \
+            --control control --work "$RUNNER_TEMP/publication" --source assembly --assets products
+
+  update-feed:
+    needs: [assemble, build, publish]
+    if: needs.assemble.outputs.build == 'true' && vars.PERSONAL_UPDATES_ENABLED == 'true'
+    runs-on: macos-26
+    timeout-minutes: 20
+    concurrency:
+      group: personal-update-feed
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-source
+          path: assembly
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: personal-dmg
+          path: products
+      - name: Prepare hash-verified Sparkle tools without credentials
+        run: |
+          python3 - <<'PY'
+          import os, sys
+          from pathlib import Path
+          sys.path.insert(0, 'control/scripts')
+          from prepare_release_tools import prepare_sparkle, sparkle_lock
+          directory = Path(os.environ['RUNNER_TEMP']) / 'personal-sparkle'
+          directory.mkdir()
+          prepare_sparkle(directory, sparkle_lock(Path('control')))
+          PY
+          swift control/scripts/verify_personal_update.swift --self-test
+      - name: Sign and publish the personal appcast
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PERSONAL_SPARKLE_PRIVATE_KEY: ${{ secrets.PERSONAL_SPARKLE_PRIVATE_KEY }}
+          PERSONAL_UPDATE_PUBLIC_KEY: ${{ vars.PERSONAL_UPDATE_PUBLIC_KEY }}
+        run: |
+          bash control/.github/personal-integration/publish-feed.sh \
+            "$GITHUB_WORKSPACE/control" "$GITHUB_WORKSPACE/assembly" "$GITHUB_WORKSPACE/products" \
+            "$RUNNER_TEMP/personal-sparkle/sparkle/bin/sign_update"
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          name: personal-appcast-${{ github.run_id }}-${{ github.run_attempt }}
+          path: products/appcast
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        id: deploy
+        with:
+          artifact_name: personal-appcast-${{ github.run_id }}-${{ github.run_attempt }}
