@@ -26,8 +26,8 @@ class DevSigningTests(unittest.TestCase):
                 stubs = {
                     'pgrep': 'exit 1',
                     'xcodebuild': '''printf '%s\\n' "$@" > "$FIXTURE_ROOT/args"
-mkdir -p "$FIXTURE_ROOT/.build/DerivedData-Dev/Build/Products/Debug/TypeWhisper.app/Contents/Resources"
-touch "$FIXTURE_ROOT/.build/DerivedData-Dev/Build/Products/Debug/TypeWhisper.app/Contents/Resources/signed-content"''',
+mkdir -p "$FIXTURE_ROOT/.build/DerivedData-Dev/Build/Products/Debug/TypeWhisper Dev.app/Contents/Resources"
+touch "$FIXTURE_ROOT/.build/DerivedData-Dev/Build/Products/Debug/TypeWhisper Dev.app/Contents/Resources/signed-content"''',
                     'ditto': 'cp -R "$1" "$2"',
                     'xattr': 'exit 0',
                     'trash': 'exit 0',
@@ -39,7 +39,9 @@ touch "$FIXTURE_ROOT/verified"''',
                     path.write_text('#!/bin/bash\nset -eu\n' + content + '\n')
                     path.chmod(0o755)
                 env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ['PATH'], FIXTURE_ROOT=str(root))
-                subprocess.run(['bash', str(scripts / 'build-dev-local.sh')], env=env, check=True, capture_output=True)
+                result = subprocess.run(['bash', str(scripts / 'build-dev-local.sh')], env=env,
+                                        text=True, capture_output=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 args = (root / 'args').read_text()
                 self.assertEqual('-allowProvisioningUpdates' in args, bool(config))
                 self.assertEqual('CODE_SIGNING_ALLOWED=NO' in args, not bool(config))
