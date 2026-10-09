@@ -30,7 +30,7 @@ class SnippetsViewModel: ObservableObject {
 
     init(snippetService: SnippetService) {
         self.snippetService = snippetService
-        self.snippets = snippetService.snippets
+        self.snippets = snippetService.snippets.filter(\.isDictationSnippet)
         setupBindings()
     }
 
@@ -39,7 +39,7 @@ class SnippetsViewModel: ObservableObject {
             .dropFirst()
             .receive(on: DispatchQueue.main)
             .sink { [weak self] snippets in
-                self?.snippets = snippets
+                self?.snippets = snippets.filter(\.isDictationSnippet)
             }
             .store(in: &cancellables)
     }
