@@ -25,8 +25,8 @@ final class PromptPaletteHandler {
         let browserInfoTask: Task<(url: String?, title: String?), Never>?
         let selectionViaCopy: Bool
         let deferredClipboardRestore: TextInsertionService.DeferredClipboardRestore?
+        var voiceEditingTarget: WorkflowVoiceEditingTarget? = nil
     }
-    private var paletteContext: PaletteContext?
 
     private let promptPaletteController: any PromptPaletteControlling
     private let textInsertionService: TextInsertionService
@@ -39,6 +39,7 @@ final class PromptPaletteHandler {
     private let activateAppForInsertionOverride: (@MainActor (String?) async -> Bool)?
 
     var onShowNotchFeedback: ((String, String, TimeInterval, Bool, String?) -> Void)?
+    var onWorkflowVoiceEditing: ((Workflow, WorkflowVoiceEditingTarget?) -> Void)?
     var onShowError: ((String) -> Void)?
     var executeActionPlugin: ((any ActionPlugin, String, String,
         (name: String?, bundleId: String?, url: String?), String?, String?) async throws -> Void)?
@@ -82,7 +83,7 @@ final class PromptPaletteHandler {
     func triggerSelection(currentState: DictationViewModel.State, soundFeedbackEnabled: Bool) {
         // Toggle behavior
         if promptPaletteController.isVisible {
-            promptPaletteController.hide()
+            hide()
             return
         }
         guard currentState == .idle else { return }
@@ -108,6 +109,7 @@ final class PromptPaletteHandler {
             activeApp: activeApp,
             browserInfoTask: browserInfoTask,
             deferClipboardRestoreForCopyFallback: false,
+            captureVoiceEditingTarget: workflows.contains(where: \.usesVoiceEditing),
             onUnavailable: { [weak self] in
                 guard let self else { return }
                 guard !recentEntries.isEmpty else {
@@ -142,6 +144,10 @@ final class PromptPaletteHandler {
             return
         }
 
+        if workflow.usesVoiceEditing {
+            onWorkflowVoiceEditing?(workflow, nil)
+            return
+        }
         let activeApp = textInsertionService.captureActiveApp()
         let browserInfoTask = makeBrowserInfoTask(activeApp: activeApp)
 
@@ -175,9 +181,30 @@ final class PromptPaletteHandler {
         activeApp: (name: String?, bundleId: String?, url: String?),
         browserInfoTask: Task<(url: String?, title: String?), Never>?,
         deferClipboardRestoreForCopyFallback: Bool,
+        captureVoiceEditingTarget: Bool = false,
         onUnavailable: @escaping () -> Void,
         completion: @escaping (PaletteContext) -> Void
     ) {
+        if captureVoiceEditingTarget {
+            Task { [weak self] in
+                guard let self else { return }
+                do {
+                    let target = try await textInsertionService.captureWorkflowVoiceEditingTarget()
+                    completion(PaletteContext(
+                        text: target.text, selection: textInsertionService.getTextSelection(), focusedElement: nil,
+                        activeApp: activeApp, browserInfoTask: browserInfoTask, selectionViaCopy: !target.supportsReplacement,
+                        deferredClipboardRestore: nil, voiceEditingTarget: target
+                    ))
+                } catch {
+                    // Ordinary workflows keep their existing clipboard path. Voice editing
+                    // requires a fresh selection, so those entries are filtered below.
+                    resolveTextContext(activeApp: activeApp, browserInfoTask: browserInfoTask,
+                                       deferClipboardRestoreForCopyFallback: deferClipboardRestoreForCopyFallback,
+                                       onUnavailable: onUnavailable, completion: completion)
+                }
+            }
+            return
+        }
         if let sel = textInsertionService.getTextSelection() {
             logger.info("[PromptPalette] Got selected text via AX: \(sel.text.prefix(80))")
             completion(PaletteContext(
@@ -242,11 +269,13 @@ final class PromptPaletteHandler {
         recentEntries: [RecentTranscriptionStore.Entry],
         soundFeedbackEnabled: Bool
     ) {
-        paletteContext = context
+        // The presentation callback owns reviewed selections. Dismissing the palette
+        // drops that callback and releases its Accessibility lease; choosing a voice
+        // workflow transfers the target to the coordinator.
 
         var entries: [PromptPaletteEntry] = []
         if context != nil {
-            entries.append(contentsOf: workflows.map { .workflow($0) })
+            entries.append(contentsOf: workflows.filter { !$0.usesVoiceEditing || context?.voiceEditingTarget != nil }.map { .workflow($0) })
         }
         entries.append(contentsOf: recentEntries.map { .recentTranscription($0) })
         guard !entries.isEmpty else { return }
@@ -255,9 +284,11 @@ final class PromptPaletteHandler {
             guard let self else { return }
             switch entry {
             case .workflow(let workflow):
-                self.processStandaloneWorkflow(workflow: workflow, soundFeedbackEnabled: soundFeedbackEnabled)
+                if let context {
+                    self.processStandaloneWorkflow(workflow: workflow, context: context, soundFeedbackEnabled: soundFeedbackEnabled)
+                }
             case .recentTranscription(let recentEntry):
-                self.paletteContext = nil
+                context?.voiceEditingTarget?.releaseResources()
                 Task { @MainActor in
                     await self.insertRecentTranscription(recentEntry)
                 }
@@ -271,17 +302,6 @@ final class PromptPaletteHandler {
         accessibilityAnnouncementService.announceError(message)
         onShowNotchFeedback?(message, "xmark.circle.fill", 2.5, true, "workflow")
         onShowError?(message)
-    }
-
-    private func processStandaloneWorkflow(workflow: Workflow, soundFeedbackEnabled: Bool) {
-        guard let ctx = paletteContext else { return }
-        paletteContext = nil
-
-        processStandaloneWorkflow(
-            workflow: workflow,
-            context: ctx,
-            soundFeedbackEnabled: soundFeedbackEnabled
-        )
     }
 
     private func insertRecentTranscription(_ entry: RecentTranscriptionStore.Entry) async {
@@ -319,6 +339,11 @@ final class PromptPaletteHandler {
         context ctx: PaletteContext,
         soundFeedbackEnabled: Bool
     ) {
+        if workflow.usesVoiceEditing {
+            onWorkflowVoiceEditing?(workflow, ctx.voiceEditingTarget)
+            return
+        }
+        ctx.voiceEditingTarget?.releaseResources()
         onShowNotchFeedback?(workflow.name + "...", "ellipsis.circle", 30, false, nil)
         accessibilityAnnouncementService.announcePromptProcessing(workflow.name)
 

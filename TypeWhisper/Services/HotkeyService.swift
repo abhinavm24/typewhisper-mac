@@ -226,6 +226,12 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     var onProfileDictationStart: ((UUID, UInt64) -> Void)?
     var onWorkflowDictationStart: ((UUID, UInt64) -> Void)?
     var onWorkflowTextProcessing: ((UUID) -> Void)?
+    var onWorkflowVoiceEditingCancel: (() -> Void)?
+    private let workflowVoiceEditingCancellationAvailable = OSAllocatedUnfairLock(initialState: false)
+    var isWorkflowVoiceEditingCancellationAvailable: Bool {
+        get { workflowVoiceEditingCancellationAvailable.withLock { $0 } }
+        set { workflowVoiceEditingCancellationAvailable.withLock { $0 = newValue } }
+    }
     var onCancelPressed: (() -> Void)?
     var onSubmitDictationPressed: ((UUID) -> Void)?
     // Capture the recording identity before dispatching from the event tap.
@@ -241,7 +247,7 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
     // Mirror the view model's cancellable state without entering MainActor from the event tap.
     private let cancellationAvailable = OSAllocatedUnfairLock(initialState: false)
     var isCancellationAvailable: Bool {
-        get { cancellationAvailable.withLock { $0 } }
+        get { cancellationAvailable.withLock { $0 } || isWorkflowVoiceEditingCancellationAvailable }
         set { cancellationAvailable.withLock { $0 = newValue } }
     }
     // Accessed by the event tap and NSEvent monitors on the main run loop.
@@ -1989,7 +1995,9 @@ final class HotkeyService: ObservableObject, @unchecked Sendable {
             isEscapeKeySuppressed = true
             // The press latch deduplicates fallback delivery without dropping a quick second press.
             performHotkeyAction(source: source) { [weak self] in
-                self?.onCancelPressed?()
+                guard let self else { return }
+                if self.isWorkflowVoiceEditingCancellationAvailable { self.onWorkflowVoiceEditingCancel?() }
+                else { self.onCancelPressed?() }
             }
             return true
         }

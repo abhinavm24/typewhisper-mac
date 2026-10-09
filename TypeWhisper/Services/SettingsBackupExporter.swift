@@ -69,6 +69,7 @@ enum SettingsBackupExporter {
     }
 
     struct SnippetDTO: Codable {
+        var scopeRawValue: String? = nil
         let trigger: String
         let replacement: String
         let caseSensitive: Bool
@@ -486,7 +487,7 @@ enum SettingsBackupExporter {
             )
         }
 
-        let snippets = snippetService.snippets.map { snippet in
+        let snippets = snippetService.snippets.filter(\.isDictationSnippet).map { snippet in
             SnippetDTO(
                 trigger: snippet.trigger,
                 replacement: snippet.replacement,
@@ -699,6 +700,17 @@ enum SettingsBackupExporter {
         result.dictionarySkipped = backup.dictionaryEntries.count - dictionaryImported
 
         for snippet in backup.snippets {
+            if let scope = snippet.scopeRawValue, scope != "dictation" {
+                if scope == "voiceTransform" || scope == "both" {
+                    if workflowService.addWorkflow(
+                        name: snippet.trigger, template: .custom, trigger: .manual(),
+                        behavior: WorkflowBehavior(settings: ["instruction": snippet.replacement], voiceEditingEnabled: true),
+                        isEnabled: snippet.isEnabled
+                    ) != nil { result.workflowsImported += 1 }
+                }
+                result.snippetsSkipped += 1
+                continue
+            }
             let beforeCount = snippetService.snippets.count
             snippetService.addSnippet(
                 trigger: snippet.trigger,
